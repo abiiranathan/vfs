@@ -1,0 +1,461 @@
+/**
+ * @file vfs.h
+ * @brief Single-file virtual filesystem (VFS).
+ *
+ * All logical files are stored inside one host file on disk.  The
+ * caller interacts with logical files through a file-descriptor-like
+ * handle (vfs_fd_t) and the familiar open/read/write/close/seek/stat
+ * interface.
+ *
+ * ## On-disk layout
+ *
+ * @code
+ * ┌──────────────────────┐  offset 0
+ * │   SuperBlock (4 KiB) │  magic, version, capacity, free-list head, …
+ * ├──────────────────────┤  offset VFS_SUPERBLOCK_SIZE
+ * │   Inode table        │  VFS_MAX_INODES × sizeof(vfs_inode_t)
+ * ├──────────────────────┤  offset VFS_DATA_OFFSET
+ * │   Data region        │  fixed-size blocks of VFS_BLOCK_SIZE bytes
+ * │   …                  │
+ * └──────────────────────┘
+ * @endcode
+ *
+ * Each inode stores the file path (up to VFS_MAX_PATH bytes), size,
+ * timestamps, and a flat array of block numbers.  A free-block bitmap
+ * lives in the superblock region.
+ *
+ * ## Thread safety
+ * A single global mutex serialises all metadata operations.  Concurrent
+ * reads of *different* files are therefore serialised too.  Applications
+ * that need true parallel I/O should stripe across multiple VFS images.
+ *
+ * ## Limitations
+ * - Maximum file size: VFS_MAX_BLOCKS_PER_FILE × VFS_BLOCK_SIZE bytes.
+ * - Maximum files:     VFS_MAX_INODES.
+ */
+
+#ifndef VFS_H
+#define VFS_H
+
+#include <inttypes.h> /* bool                          */
+#include <stdbool.h>  /* bool                          */
+#include <stddef.h>   /* size_t                        */
+#include <stdint.h>   /* uint8_t, uint32_t, uint64_t   */
+#include <stdio.h>    /* FILE*                       */
+#include <sys/types.h>/* off_t                         */
+#include <time.h>     /* time_t                        */
+
+/* -------------------------------------------------------------------------
+ * Compile-time tunables
+ * ---------------------------------------------------------------------- */
+
+/** Block size in bytes.  Must be a power of two. */
+#define VFS_BLOCK_SIZE 4096u
+
+/** Maximum number of inodes (== maximum number of files). */
+#define VFS_MAX_INODES 1024u
+
+/** Maximum number of data blocks per file. */
+#define VFS_MAX_BLOCKS_PER_FILE 256u
+
+/** Maximum file-path length including the NUL terminator. */
+#define VFS_MAX_PATH 256u
+
+/** Size reserved for the superblock region (must be >= sizeof(vfs_super_t)). */
+#define VFS_SUPERBLOCK_SIZE 65536u
+
+/** Maximum number of simultaneously open file descriptors. */
+#define VFS_MAX_OPEN_FILES 64u
+
+/** Magic number that identifies a valid VFS image. */
+#define VFS_MAGIC UINT32_C(0x56465301) /* "VFS\x01" */
+
+/** Current on-disk format version. */
+#define VFS_VERSION UINT32_C(1)
+
+/* Derived constants – do not change. */
+
+/** Number of 32-bit words needed to store a free-block bitmap. */
+#define VFS_BITMAP_WORDS (((VFS_MAX_INODES * VFS_MAX_BLOCKS_PER_FILE) + 31u) / 32u)
+
+/** Total addressable data blocks. */
+#define VFS_TOTAL_BLOCKS (VFS_MAX_INODES * VFS_MAX_BLOCKS_PER_FILE)
+
+/** Byte offset of the inode table inside the image. */
+#define VFS_INODE_TABLE_OFFSET ((off_t)VFS_SUPERBLOCK_SIZE)
+
+/** Byte offset of the first data block inside the image. */
+#define VFS_DATA_OFFSET ((off_t)(VFS_SUPERBLOCK_SIZE + (VFS_MAX_INODES * sizeof(vfs_inode_t))))
+
+/* -------------------------------------------------------------------------
+ * Error codes
+ * ---------------------------------------------------------------------- */
+
+/** Return codes used throughout the API. */
+typedef enum {
+    VFS_OK = 0,             /**< Success.                               */
+    VFS_ERR_IO = -1,        /**< Underlying host I/O error.             */
+    VFS_ERR_CORRUPT = -2,   /**< Image magic / checksum mismatch.       */
+    VFS_ERR_NOTFOUND = -3,  /**< No such file.                          */
+    VFS_ERR_EXISTS = -4,    /**< File already exists.                   */
+    VFS_ERR_NOSPACE = -5,   /**< No free inodes or data blocks.         */
+    VFS_ERR_NOMEM = -6,     /**< Host malloc/calloc failure.            */
+    VFS_ERR_BADFD = -7,     /**< Invalid or closed file descriptor.     */
+    VFS_ERR_OVERFLOW = -8,  /**< Would exceed per-file block limit.     */
+    VFS_ERR_INVAL = -9,     /**< Invalid argument (NULL, bad whence…).  */
+    VFS_ERR_ISDIR = -10,    /**< Path refers to a directory (reserved). */
+    VFS_ERR_READONLY = -11, /**< Write attempted on read-only mount.    */
+} vfs_status_t;
+
+/* -------------------------------------------------------------------------
+ * Open flags (OR-able bit flags, like POSIX O_*)
+ * ---------------------------------------------------------------------- */
+
+#define VFS_O_RDONLY 0x00u /**< Open for reading only.                */
+#define VFS_O_WRONLY 0x01u /**< Open for writing only.                */
+#define VFS_O_RDWR   0x02u /**< Open for reading and writing.         */
+#define VFS_O_CREAT  0x04u /**< Create file if it does not exist.     */
+#define VFS_O_TRUNC  0x08u /**< Truncate to zero length on open.      */
+#define VFS_O_APPEND 0x10u /**< Writes always go to end of file.      */
+#define VFS_O_EXCL   0x20u /**< With O_CREAT: fail if file exists.    */
+
+/* -------------------------------------------------------------------------
+ * Seek origins (mirrors POSIX SEEK_*)
+ * ---------------------------------------------------------------------- */
+
+#define VFS_SEEK_SET 0 /**< From beginning of file.  */
+#define VFS_SEEK_CUR 1 /**< From current position.   */
+#define VFS_SEEK_END 2 /**< From end of file.         */
+
+/* -------------------------------------------------------------------------
+ * On-disk structures
+ *
+ * Every on-disk structure must be a fixed size and is written / read as a
+ * raw byte sequence.  Fields use explicit-width types; no padding surprises.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * On-disk inode.  Stores metadata and the list of allocated block numbers
+ * for one logical file.  A zero `path[0]` byte means the slot is free.
+ */
+typedef struct {
+    char path[VFS_MAX_PATH];                  /**< Absolute virtual path, NUL-terminated. */
+    uint64_t size;                            /**< Logical file size in bytes.             */
+    uint64_t created_at;                      /**< Creation timestamp (Unix seconds).      */
+    uint64_t modified_at;                     /**< Last-write timestamp (Unix seconds).    */
+    uint32_t block_count;                     /**< Number of allocated blocks.             */
+    uint32_t blocks[VFS_MAX_BLOCKS_PER_FILE]; /**< Block numbers (indices into data area). */
+    uint8_t _pad[4];                          /**< Explicit padding for alignment.         */
+} vfs_inode_t;
+
+/**
+ * On-disk superblock.  Always lives at offset 0 of the image file.
+ * Fixed at VFS_SUPERBLOCK_SIZE bytes; the tail is unused/zeroed.
+ */
+typedef struct {
+    uint32_t magic;                    /**< Must equal VFS_MAGIC.            */
+    uint32_t version;                  /**< Must equal VFS_VERSION.          */
+    uint32_t block_size;               /**< Must equal VFS_BLOCK_SIZE.       */
+    uint32_t max_inodes;               /**< Must equal VFS_MAX_INODES.       */
+    uint32_t total_blocks;             /**< Must equal VFS_TOTAL_BLOCKS.     */
+    uint32_t free_block_count;         /**< Informational; not authoritative.*/
+    uint32_t free_inode_count;         /**< Informational; not authoritative.*/
+    uint8_t _reserved[4];              /**< Future use.                      */
+    uint32_t bitmap[VFS_BITMAP_WORDS]; /**< Free-block bitmap (1 = free).    */
+} vfs_super_t;
+
+_Static_assert(sizeof(vfs_super_t) <= VFS_SUPERBLOCK_SIZE, "vfs_super_t exceeds VFS_SUPERBLOCK_SIZE");
+
+/* -------------------------------------------------------------------------
+ * Runtime handles (opaque to callers)
+ * ---------------------------------------------------------------------- */
+
+/** Opaque handle for a mounted VFS image.  Obtain via vfs_open(). */
+typedef struct vfs_t vfs_t;
+
+/**
+ * File descriptor returned by vfs_fopen().
+ * Negative values indicate an error (cast to vfs_status_t).
+ */
+typedef int vfs_fd_t;
+
+/* -------------------------------------------------------------------------
+ * File stat
+ * ---------------------------------------------------------------------- */
+
+/** File metadata returned by vfs_fstat(). */
+typedef struct {
+    char path[VFS_MAX_PATH]; /**< Virtual path of the file.            */
+    uint64_t size;           /**< Logical file size in bytes.           */
+    uint32_t block_count;    /**< Number of data blocks allocated.      */
+    time_t created_at;       /**< Creation time.                        */
+    time_t modified_at;      /**< Last modification time.               */
+} vfs_stat_t;
+
+/* -------------------------------------------------------------------------
+ * Filesystem lifecycle
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Creates a new VFS image on disk at @p image_path and mounts it.
+ *
+ * If a file already exists at @p image_path it is overwritten.
+ *
+ * @param image_path  Host filesystem path for the image file.
+ * @param out_vfs     On success, set to the mounted VFS handle. Never NULL.
+ * @return VFS_OK on success, or a negative vfs_status_t on failure.
+ * @note Caller must eventually call vfs_close() on the returned handle.
+ */
+vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs);
+
+/**
+ * Opens (mounts) an existing VFS image.
+ *
+ * @param image_path  Host filesystem path of the image to open.
+ * @param readonly    If true the image is opened read-only.
+ * @param out_vfs     On success, set to the mounted VFS handle. Never NULL.
+ * @return VFS_OK, VFS_ERR_CORRUPT if the magic/version is wrong, or another
+ *         negative vfs_status_t on I/O failure.
+ * @note Caller must eventually call vfs_close() on the returned handle.
+ */
+vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs);
+
+/**
+ * Flushes all pending writes and closes the VFS handle.
+ *
+ * @p vfs is freed and must not be used after this call.  NULL is a no-op.
+ *
+ * @param vfs  Handle returned by vfs_create() or vfs_open().
+ */
+void vfs_close(vfs_t* vfs);
+
+/**
+ * Flushes in-memory superblock / inode changes to the host file without
+ * closing the VFS.
+ *
+ * @param vfs  Mounted VFS handle.
+ * @return VFS_OK or a negative vfs_status_t.
+ */
+vfs_status_t vfs_sync(vfs_t* vfs);
+
+/* -------------------------------------------------------------------------
+ * File operations
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Opens a logical file inside the VFS, optionally creating it.
+ *
+ * @param vfs    Mounted VFS handle.
+ * @param path   Absolute virtual path, e.g. "/data/image.png".
+ * @param flags  Bitwise OR of VFS_O_* flags.
+ * @return A non-negative vfs_fd_t on success, or a negative vfs_status_t.
+ */
+vfs_fd_t vfs_fopen(vfs_t* vfs, const char* path, unsigned int flags);
+
+/**
+ * Closes an open file descriptor, flushing any pending metadata.
+ *
+ * @param vfs  Mounted VFS handle.
+ * @param fd   Descriptor returned by vfs_fopen().
+ * @return VFS_OK or VFS_ERR_BADFD.
+ */
+vfs_status_t vfs_fclose(vfs_t* vfs, vfs_fd_t fd);
+
+/**
+ * Reads up to @p count bytes from @p fd into @p buf.
+ *
+ * Advances the file position by the number of bytes read.
+ *
+ * @param vfs    Mounted VFS handle.
+ * @param fd     Open file descriptor.
+ * @param buf    Destination buffer.  Must be at least @p count bytes.
+ * @param count  Maximum bytes to read.
+ * @param[out] bytes_read  Bytes actually read (0 at EOF).  Never NULL.
+ * @return VFS_OK or a negative vfs_status_t.
+ */
+vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t* bytes_read);
+
+/**
+ * Writes @p count bytes from @p buf into @p fd.
+ *
+ * Allocates new blocks as needed.  In append mode the cursor is advanced to
+ * EOF before each write.
+ *
+ * @param vfs    Mounted VFS handle.
+ * @param fd     Open file descriptor (must have write permission).
+ * @param buf    Source buffer.
+ * @param count  Number of bytes to write.
+ * @param[out] bytes_written  Bytes actually written.  Never NULL.
+ * @return VFS_OK or a negative vfs_status_t (VFS_ERR_NOSPACE, VFS_ERR_OVERFLOW…).
+ */
+vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, size_t* bytes_written);
+
+/**
+ * Repositions the read/write cursor for @p fd.
+ *
+ * @param vfs     Mounted VFS handle.
+ * @param fd      Open file descriptor.
+ * @param offset  Byte offset relative to @p whence.
+ * @param whence  VFS_SEEK_SET, VFS_SEEK_CUR, or VFS_SEEK_END.
+ * @param[out] new_offset  Resulting absolute offset.  May be NULL.
+ * @return VFS_OK or a negative vfs_status_t.
+ */
+vfs_status_t vfs_fseek(vfs_t* vfs, vfs_fd_t fd, off_t offset, int whence, off_t* new_offset);
+
+/**
+ * Returns the current cursor position of @p fd.
+ *
+ * @param vfs  Mounted VFS handle.
+ * @param fd   Open file descriptor.
+ * @param[out] pos  Current byte offset from the start of the file.  Never NULL.
+ * @return VFS_OK or a negative vfs_status_t.
+ */
+vfs_status_t vfs_ftell(vfs_t* vfs, vfs_fd_t fd, off_t* pos);
+
+/**
+ * Truncates @p path to exactly @p length bytes.
+ *
+ * Extends with zero bytes if @p length > current size.  Blocks beyond the
+ * new end are freed.
+ *
+ * @param vfs     Mounted VFS handle.
+ * @param path    Virtual path of the file to truncate.
+ * @param length  New file size in bytes.
+ * @return VFS_OK or a negative vfs_status_t.
+ */
+vfs_status_t vfs_truncate(vfs_t* vfs, const char* path, uint64_t length);
+
+/**
+ * Retrieves metadata for @p path.
+ *
+ * @param vfs   Mounted VFS handle.
+ * @param path  Virtual path of the file.
+ * @param[out] st  Populated on success.  Never NULL.
+ * @return VFS_OK or VFS_ERR_NOTFOUND.
+ */
+vfs_status_t vfs_stat(vfs_t* vfs, const char* path, vfs_stat_t* st);
+
+/**
+ * Deletes a file from the VFS, freeing its inode and data blocks.
+ *
+ * @param vfs   Mounted VFS handle.
+ * @param path  Virtual path of the file to remove.
+ * @return VFS_OK or VFS_ERR_NOTFOUND.
+ */
+vfs_status_t vfs_unlink(vfs_t* vfs, const char* path);
+
+/**
+ * Tests whether a file exists in the VFS.
+ *
+ * @param vfs   Mounted VFS handle.
+ * @param path  Virtual path to test.
+ * @return true if the file exists, false otherwise.
+ */
+bool vfs_exists(vfs_t* vfs, const char* path);
+
+/* -------------------------------------------------------------------------
+ * Directory-like listing
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Callback invoked once per file by vfs_list().
+ *
+ * @param path      Virtual path of the file.
+ * @param st        Metadata for the file.
+ * @param userdata  Pointer passed through from vfs_list().
+ * @return Return true to continue iteration, false to stop early.
+ */
+typedef bool (*vfs_list_cb_t)(const char* path, const vfs_stat_t* st, void* userdata);
+
+/**
+ * Iterates over every file whose virtual path starts with @p prefix.
+ *
+ * Pass "/" or "" to list all files.
+ *
+ * @param vfs       Mounted VFS handle.
+ * @param prefix    Path prefix to filter by.
+ * @param callback  Called once per matching file.
+ * @param userdata  Forwarded opaquely to @p callback.
+ */
+void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* userdata);
+
+/* -------------------------------------------------------------------------
+ * Utility
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Returns a human-readable string for @p status.
+ *
+ * @param status  A vfs_status_t value.
+ * @return Pointer to a static string.  Never NULL.
+ */
+const char* vfs_strerror(vfs_status_t status);
+
+/**
+ * Writes a diagnostic dump of the superblock and inode table to @p out.
+ *
+ * @param vfs  Mounted VFS handle.
+ * @param out  Destination FILE* (e.g. stdout).
+ */
+void vfs_dump(const vfs_t* vfs, FILE* out);
+
+/* Write string content to a path inside the VFS */
+static inline vfs_status_t write_vfs_file(vfs_t* vfs, const char* path, const void* content, size_t len) {
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_CREAT | VFS_O_WRONLY | VFS_O_TRUNC);
+    if (fd < 0) { return (vfs_status_t)fd; }
+
+    size_t written = 0;
+    vfs_status_t status = vfs_fwrite(vfs, fd, content, len, &written);
+    vfs_fclose(vfs, fd);
+
+    if (status != VFS_OK) { return status; }
+    return (written == len) ? VFS_OK : VFS_ERR_IO;
+}
+
+/* Append data to an existing or new VFS file */
+static inline vfs_status_t append_vfs_file(vfs_t* vfs, const char* path, void* data, size_t len) {
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_CREAT | VFS_O_WRONLY | VFS_O_APPEND);
+    if (fd < 0) { return (vfs_status_t)fd; }
+
+    size_t written = 0;
+    vfs_status_t status = vfs_fwrite(vfs, fd, data, len, &written);
+    vfs_fclose(vfs, fd);
+
+    if (status != VFS_OK) { return status; }
+    return (written == len) ? VFS_OK : VFS_ERR_IO;
+}
+
+/**
+ * Renames (moves) the file at @p oldpath to @p newpath.
+ *
+ * If @p newpath already names an existing file it is atomically replaced,
+ * consistent with POSIX rename(2) semantics.  No data blocks are moved;
+ * only the inode's path field is updated.
+ *
+ * Disk-write ordering guarantees that a crash leaves the image either
+ * fully renamed or with the old name still intact (the victim inode is
+ * zeroed before the source inode is updated).
+
+ * What this implementation deliberately does not do.
+ * 
+ * Path-prefix rewriting. If you rename /logs to /archive hoping that /logs/app.log becomes /archive/app.log, 
+ * that will not happen. 
+ * This VFS stores full absolute paths per inode; there is no hierarchical namespace, 
+ * so a "directory rename" would require scanning all inodes for the prefix and rewriting each one individually. 
+ * That is a separate, more complex operation.
+ * Journal / WAL crash safety. A crash between steps A and B leaves the victim gone and the source unrenamed. 
+ * Closing that gap requires either a write-ahead log or a shadow-page scheme — significant additions to the architecture.
+ * Hard links / symlinks. Not in scope; the data model supports neither.
+ * 
+ * @param vfs      Mounted VFS handle.
+ * @param oldpath  Current virtual path of the file.
+ * @param newpath  Desired virtual path.
+ * @return VFS_OK on success, or:
+ *   - VFS_ERR_INVAL    if either path is NULL/empty or newpath is too long.
+ *   - VFS_ERR_NOTFOUND if oldpath does not exist.
+ *   - VFS_ERR_READONLY if the filesystem is mounted read-only.
+ *   - VFS_ERR_IO       on disk write failure.
+ */
+vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath);
+
+#endif /* VFS_H */
