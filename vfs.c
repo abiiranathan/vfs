@@ -1,6 +1,6 @@
 /**
  * @file vfs.c
- * @brief Implementation of the single-file virtual filesystem (VFS).
+ * @brief Scaled single-file Virtual Filesystem (VFS) with low write amplification.
  *
  * See vfs.h for the complete API documentation and on-disk layout.
  *
@@ -10,41 +10,46 @@
  * A `vfs_t` holds:
  *   - the host file descriptor,
  *   - the fully-decoded superblock (`vfs_super_t`),
+ *   - the heap-allocated block allocation bitmap,
  *   - the complete inode table (`vfs_inode_t[VFS_MAX_INODES]`),
  *   - a table of open-file entries (`open_file_t[VFS_MAX_OPEN_FILES]`).
  *
- * The superblock and inode table are loaded entirely into memory on mount
- * and written back by vfs_sync() / vfs_close().  Individual data blocks are
+ * The superblock, bitmap, and inode table are loaded entirely into memory on mount
+ * and written back by vfs_sync() / vfs_close(). Individual data blocks are
  * read and written directly to/from the host file; they are never cached.
  *
  * ### Locking
- * A single `pthread_mutex_t` serialises every public API call.  The helpers
+ * A single `pthread_mutex_t` serialises every public API call. The helpers
  * that do the real work (suffixed `_locked`) must be called with the mutex
- * already held.
+ * already held. Re-entrancy protections are built into iterative functions
+ * (e.g. `vfs_list`) by temporarily releasing the lock around client callbacks.
  *
- * ### Block addressing
- * Block number N occupies host-file bytes
- *   [VFS_DATA_OFFSET + N*VFS_BLOCK_SIZE, VFS_DATA_OFFSET + (N+1)*VFS_BLOCK_SIZE).
- * Block 0 is valid; the bitmap uses 1 to mean FREE and 0 to mean USED.
+ * ### Block addressing & Indirect translation
+ * Logical block indexes are resolved via the block map function `vfs_bmap_locked()`.
+ * Files are represented as direct blocks up to logical index 253. Index 254 stores
+ * a single indirect index table block, and index 255 stores a double indirect index
+ * table block. This allows logical indexing up to VFS_MAX_BLOCKS_PER_FILE blocks.
+ *
+ * ### Block 0 reservation
+ * Physical block 0 is permanently reserved (marked used in the bitmap) and is
+ * never handed to any file. This makes 0 a safe "no block allocated" sentinel
+ * throughout all inode block arrays, indirect tables, and the vfs_fread sparse-
+ * hole detection check (`if (blk == 0) { zero-fill; }`).
  */
 
 #include "vfs.h"
 
-#include <assert.h>    /* assert                                    */
-#include <errno.h>     /* errno, EINVAL …                           */
-#include <fcntl.h>     /* open, O_RDONLY, O_RDWR, O_CREAT, O_TRUNC */
-#include <pthread.h>   /* pthread_mutex_t, pthread_mutex_{lock,…}   */
-#include <stdarg.h>    /* (unused – kept for future debug helpers)  */
-#include <stdio.h>     /* FILE, fprintf, fflush                     */
-#include <stdlib.h>    /* malloc, calloc, free                      */
-#include <string.h>    /* memset, memcpy, strncmp, strlen           */
-#include <sys/types.h> /* off_t, ssize_t                            */
-#include <time.h>      /* time                                      */
-#include <unistd.h>    /* pread, pwrite, close, ftruncate           */
-
-/* -------------------------------------------------------------------------
- * Internal constants
- * ---------------------------------------------------------------------- */
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 /** Sentinel value meaning "no inode assigned". */
 #define INODE_NONE UINT32_MAX
@@ -52,9 +57,12 @@
 /** Sentinel value meaning "slot is free" in the open-file table. */
 #define OFT_FREE (-1)
 
-/* -------------------------------------------------------------------------
- * Internal: open-file table entry
- * ---------------------------------------------------------------------- */
+/** Offset limits and array indices used during indirect address mapping. */
+#define VFS_DIRECT_BLOCKS         254u
+#define VFS_SINGLE_INDIRECT_INDEX 254u
+#define VFS_DOUBLE_INDIRECT_INDEX 255u
+
+#define VFS_SUMMARY_WORDS ((VFS_BITMAP_WORDS + 31u) / 32u)
 
 /**
  * One entry in the runtime open-file table.
@@ -66,16 +74,14 @@ typedef struct {
     unsigned flags; /**< The VFS_O_* flags the file was opened with.*/
 } open_file_t;
 
-/* -------------------------------------------------------------------------
- * Internal: runtime VFS handle
- * ---------------------------------------------------------------------- */
-
-/** Runtime representation of a mounted VFS image. */
 struct vfs_t {
     int fd;                              /**< Host file descriptor.              */
+    uint32_t alloc_hint;                 /* Index of first bitmap word that may contain a free block. */
     bool readonly;                       /**< True when mounted read-only.       */
     pthread_mutex_t lock;                /**< Serialises all metadata ops.       */
     vfs_super_t super;                   /**< In-memory superblock.              */
+    uint32_t* bitmap;                    /**< Heap-allocated block bitmap.       */
+    uint32_t* summary_bitmap;            /**< Purely in-memory summary bitmap.       */
     vfs_inode_t inodes[VFS_MAX_INODES];  /**< In-memory inode table.             */
     open_file_t oft[VFS_MAX_OPEN_FILES]; /**< Open-file table.                   */
 };
@@ -99,10 +105,7 @@ static vfs_status_t pwrite_all(int fd, const void* buf, size_t n, off_t off) {
             if (errno == EINTR) { continue; }
             return VFS_ERR_IO;
         }
-        if (w == 0) {
-            /* Unexpected: pwrite should never return 0 on a regular file. */
-            return VFS_ERR_IO;
-        }
+        if (w == 0) { return VFS_ERR_IO; }
         p += (size_t)w;
         off += (off_t)w;
         rem -= (size_t)w;
@@ -125,10 +128,7 @@ static vfs_status_t pread_all(int fd, void* buf, size_t n, off_t off) {
             if (errno == EINTR) { continue; }
             return VFS_ERR_IO;
         }
-        if (r == 0) {
-            /* Premature EOF — image is truncated. */
-            return VFS_ERR_IO;
-        }
+        if (r == 0) { return VFS_ERR_IO; }
         p += (size_t)r;
         off += (off_t)r;
         rem -= (size_t)r;
@@ -137,20 +137,51 @@ static vfs_status_t pread_all(int fd, void* buf, size_t n, off_t off) {
 }
 
 /* =========================================================================
- * Superblock & inode persistence
+ * Superblock, Bitmap, and Inode Persistence
  * ======================================================================= */
 
 /**
- * Flushes the in-memory superblock to the host file.
+ * Flushes the in-memory superblock structure to the host file.
  * Caller must hold vfs->lock.
  *
  * @return VFS_OK or VFS_ERR_IO.
  */
 static vfs_status_t super_write_locked(vfs_t* vfs) {
-    /* Write the entire VFS_SUPERBLOCK_SIZE region; the tail beyond
-     * sizeof(vfs_super_t) was zeroed at creation time and we never
-     * dirty it, so this is safe. */
     return pwrite_all(vfs->fd, &vfs->super, sizeof(vfs->super), (off_t)0);
+}
+
+/**
+ * Flushes the in-memory block bitmap to the host file.
+ * Caller must hold vfs->lock.
+ *
+ * @return VFS_OK or VFS_ERR_IO.
+ */
+static vfs_status_t bitmap_write_locked(vfs_t* vfs) {
+    return pwrite_all(vfs->fd, vfs->bitmap, VFS_BITMAP_WORDS * sizeof(uint32_t), VFS_BITMAP_OFFSET);
+}
+
+/**
+ * Flushes a single 32-bit word of the block bitmap to the host file.
+ * Used to avoid writing the entire bitmap region during common metadata ops.
+ * Caller must hold vfs->lock.
+ *
+ * @param word_idx Index of the 32-bit word in the bitmap array.
+ * @return VFS_OK or VFS_ERR_IO.
+ */
+static vfs_status_t bitmap_write_word_locked(vfs_t* vfs, uint32_t word_idx) {
+    assert(word_idx < VFS_BITMAP_WORDS);
+    off_t off = VFS_BITMAP_OFFSET + (off_t)(word_idx * sizeof(uint32_t));
+    return pwrite_all(vfs->fd, &vfs->bitmap[word_idx], sizeof(uint32_t), off);
+}
+
+/**
+ * Reads the block bitmap from the host file into memory.
+ * Caller must hold vfs->lock.
+ *
+ * @return VFS_OK or VFS_ERR_IO.
+ */
+static vfs_status_t bitmap_read_locked(vfs_t* vfs) {
+    return pread_all(vfs->fd, vfs->bitmap, VFS_BITMAP_WORDS * sizeof(uint32_t), VFS_BITMAP_OFFSET);
 }
 
 /**
@@ -177,7 +208,7 @@ static vfs_status_t inode_write_locked(vfs_t* vfs, uint32_t idx) {
 }
 
 /* =========================================================================
- * Free-block bitmap helpers
+ * Free-block Bitmap helpers
  * ======================================================================= */
 
 /**
@@ -188,7 +219,7 @@ static bool bitmap_is_free(const vfs_t* vfs, uint32_t blk) {
     assert(blk < VFS_TOTAL_BLOCKS);
     uint32_t word = blk / 32u;
     uint32_t bit = blk % 32u;
-    return (vfs->super.bitmap[word] & (UINT32_C(1) << bit)) != 0;
+    return (vfs->bitmap[word] & (UINT32_C(1) << bit)) != 0;
 }
 
 /**
@@ -199,7 +230,7 @@ static void bitmap_set_used(vfs_t* vfs, uint32_t blk) {
     assert(blk < VFS_TOTAL_BLOCKS);
     uint32_t word = blk / 32u;
     uint32_t bit = blk % 32u;
-    vfs->super.bitmap[word] &= ~(UINT32_C(1) << bit);
+    vfs->bitmap[word] &= ~(UINT32_C(1) << bit);
 }
 
 /**
@@ -210,38 +241,440 @@ static void bitmap_set_free(vfs_t* vfs, uint32_t blk) {
     assert(blk < VFS_TOTAL_BLOCKS);
     uint32_t word = blk / 32u;
     uint32_t bit = blk % 32u;
-    vfs->super.bitmap[word] |= (UINT32_C(1) << bit);
+    vfs->bitmap[word] |= (UINT32_C(1) << bit);
 }
 
 /**
  * Allocates one free block and marks it used.
  * Caller must hold vfs->lock.
  *
+ * Block 0 is permanently reserved as the "no block" sentinel and is
+ * never returned here; the scan begins at index 1.
+ *
  * @param[out] out_blk  Block number allocated.
  * @return VFS_OK or VFS_ERR_NOSPACE.
  */
 static vfs_status_t block_alloc_locked(vfs_t* vfs, uint32_t* out_blk) {
-    for (uint32_t i = 0; i < VFS_TOTAL_BLOCKS; i++) {
-        if (bitmap_is_free(vfs, i)) {
-            bitmap_set_used(vfs, i);
+    uint32_t w_start = vfs->alloc_hint;
+    uint32_t sw_start = w_start / 32u;
+    uint32_t sbit_start = w_start % 32u;
+
+    uint32_t max_sw = VFS_SUMMARY_WORDS;
+
+    for (uint32_t sw = sw_start; sw < max_sw; sw++) {
+        uint32_t s_word = vfs->summary_bitmap[sw];
+
+        /* Mask out bits below our start offset on the first word */
+        if (sw == sw_start) { s_word &= (0xFFFFFFFFu << sbit_start); }
+
+        while (s_word != 0) {
+            uint32_t s_bit = (uint32_t)__builtin_ctz(s_word);
+            uint32_t w = sw * 32u + s_bit;
+
+            if (w >= VFS_BITMAP_WORDS) { break; }
+
+            uint32_t word = vfs->bitmap[w];
+            uint32_t bit = (uint32_t)__builtin_ctz(word);
+            uint32_t blk = w * 32u + bit;
+
+            /* Special case: block 0 is reserved */
+            if (blk == 0) {
+                word &= ~UINT32_C(1);
+                if (word == 0) {
+                    /* Word 0 had no other free blocks besides block 0 */
+                    vfs->summary_bitmap[sw] &= ~(1u << s_bit);
+                    s_word &= ~(1u << s_bit);
+                    continue;
+                }
+                bit = (uint32_t)__builtin_ctz(word);
+                blk = w * 32u + bit;
+            }
+
+            if (blk >= VFS_TOTAL_BLOCKS) { break; }
+
+            bitmap_set_used(vfs, blk);
             if (vfs->super.free_block_count > 0) { vfs->super.free_block_count--; }
-            *out_blk = i;
-            return VFS_OK;
+            *out_blk = blk;
+
+            /* If the word is now fully exhausted, clear its bit in the summary */
+            if (vfs->bitmap[w] == 0) {
+                vfs->summary_bitmap[sw] &= ~(1u << s_bit);
+                vfs->alloc_hint = w + 1;
+            } else {
+                vfs->alloc_hint = w;
+            }
+
+            return bitmap_write_word_locked(vfs, w);
         }
+        sbit_start = 0; /* Reset bit offset for subsequent summary words */
     }
+
+    vfs->alloc_hint = VFS_BITMAP_WORDS;
     return VFS_ERR_NOSPACE;
 }
 
 /**
  * Frees a previously-allocated block.
  * Caller must hold vfs->lock.
+ *
+ * @param blk  Physical block number to release.
+ * @return VFS_OK or VFS_ERR_IO.
  */
-static void block_free_locked(vfs_t* vfs, uint32_t blk) {
+static vfs_status_t block_free_locked(vfs_t* vfs, uint32_t blk) {
     assert(blk < VFS_TOTAL_BLOCKS);
     if (!bitmap_is_free(vfs, blk)) {
         bitmap_set_free(vfs, blk);
         vfs->super.free_block_count++;
+
+        uint32_t word = blk / 32u;
+
+        /* Update the summary bitmap */
+        uint32_t sw = word / 32u;
+        uint32_t sbit = word % 32u;
+        vfs->summary_bitmap[sw] |= (1u << sbit);
+
+        if (word < vfs->alloc_hint) { vfs->alloc_hint = word; }
+
+        return bitmap_write_word_locked(vfs, word);
     }
+    return VFS_OK;
+}
+
+/* =========================================================================
+ * Physical addressing helpers
+ * ======================================================================= */
+
+/**
+ * Returns the host-file byte offset for physical block @p blk.
+ */
+static off_t block_offset(uint32_t blk) {
+    return VFS_DATA_OFFSET + (off_t)blk * (off_t)VFS_BLOCK_SIZE;
+}
+
+/**
+ * Zero-fills block @p blk on disk.
+ * Caller must hold vfs->lock.
+ *
+ * @return VFS_OK or VFS_ERR_IO.
+ */
+static vfs_status_t block_zero_locked(vfs_t* vfs, uint32_t blk) {
+    static const uint8_t zeros[VFS_BLOCK_SIZE];
+    return pwrite_all(vfs->fd, zeros, VFS_BLOCK_SIZE, block_offset(blk));
+}
+
+/* =========================================================================
+ * Multi-Level Indirect Addressing Map & Truncate
+ * ======================================================================= */
+
+/**
+ * Resolves a file-relative logical block index to its physical block ID on disk.
+ *
+ * If @p alloc is set to true, this function will automatically allocate,
+ * zero-initialize, and link intermediate tables and blocks as required.
+ *
+ * @param vfs            Mounted VFS handle.
+ * @param inode_idx      Target file inode index.
+ * @param logical_block  Target logical block number inside the file.
+ * @param alloc          Set to true to allocate missing block structures.
+ * @param physical_block Pointer populated with resolved physical block ID.
+ * @return VFS_OK, VFS_ERR_OVERFLOW, VFS_ERR_NOSPACE or VFS_ERR_IO.
+ */
+static vfs_status_t vfs_bmap_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t logical_block, bool alloc,
+                                    uint32_t* physical_block) {
+    vfs_inode_t* in = &vfs->inodes[inode_idx];
+    if (logical_block >= VFS_MAX_BLOCKS_PER_FILE) { return VFS_ERR_OVERFLOW; }
+
+    /* 1. Direct Block */
+    if (logical_block < VFS_DIRECT_BLOCKS) {
+        uint32_t blk = in->blocks[logical_block];
+        if (blk == 0) {
+            if (!alloc) {
+                *physical_block = 0;
+                return VFS_OK;
+            }
+            vfs_status_t s = block_alloc_locked(vfs, &blk);
+            if (s != VFS_OK) { return s; }
+            s = block_zero_locked(vfs, blk);
+            if (s != VFS_OK) {
+                (void)block_free_locked(vfs, blk);
+                return s;
+            }
+            in->blocks[logical_block] = blk;
+            in->block_count++;
+        }
+        *physical_block = blk;
+        return VFS_OK;
+    }
+
+    /* 2. Single-Indirect Block */
+    uint32_t single_limit = VFS_DIRECT_BLOCKS + 1024u;
+    if (logical_block < single_limit) {
+        uint32_t sub_idx = logical_block - VFS_DIRECT_BLOCKS;
+        uint32_t sib_blk = in->blocks[VFS_SINGLE_INDIRECT_INDEX];
+        bool sib_created = false;
+
+        if (sib_blk == 0) {
+            if (!alloc) {
+                *physical_block = 0;
+                return VFS_OK;
+            }
+            vfs_status_t s = block_alloc_locked(vfs, &sib_blk);
+            if (s != VFS_OK) { return s; }
+            s = block_zero_locked(vfs, sib_blk);
+            if (s != VFS_OK) {
+                (void)block_free_locked(vfs, sib_blk);
+                return s;
+            }
+            in->blocks[VFS_SINGLE_INDIRECT_INDEX] = sib_blk;
+            sib_created = true;
+        }
+
+        uint32_t table[1024];
+        if (!sib_created) {
+            vfs_status_t s = pread_all(vfs->fd, table, sizeof(table), block_offset(sib_blk));
+            if (s != VFS_OK) { return s; }
+        } else {
+            memset(table, 0, sizeof(table));
+        }
+
+        uint32_t blk = table[sub_idx];
+        if (blk == 0) {
+            if (!alloc) {
+                *physical_block = 0;
+                return VFS_OK;
+            }
+            vfs_status_t s = block_alloc_locked(vfs, &blk);
+            if (s != VFS_OK) { return s; }
+            s = block_zero_locked(vfs, blk);
+            if (s != VFS_OK) {
+                (void)block_free_locked(vfs, blk);
+                return s;
+            }
+            table[sub_idx] = blk;
+            s = pwrite_all(vfs->fd, table, sizeof(table), block_offset(sib_blk));
+            if (s != VFS_OK) {
+                (void)block_free_locked(vfs, blk);
+                return s;
+            }
+            in->block_count++;
+        }
+        *physical_block = blk;
+        return VFS_OK;
+    }
+
+    /* 3. Double-Indirect Block */
+    uint32_t offset = logical_block - single_limit;
+    uint32_t dib_idx = offset / 1024u;
+    uint32_t sib_idx = offset % 1024u;
+
+    uint32_t dib_blk = in->blocks[VFS_DOUBLE_INDIRECT_INDEX];
+    bool dib_created = false;
+
+    if (dib_blk == 0) {
+        if (!alloc) {
+            *physical_block = 0;
+            return VFS_OK;
+        }
+        vfs_status_t s = block_alloc_locked(vfs, &dib_blk);
+        if (s != VFS_OK) { return s; }
+        s = block_zero_locked(vfs, dib_blk);
+        if (s != VFS_OK) {
+            (void)block_free_locked(vfs, dib_blk);
+            return s;
+        }
+        in->blocks[VFS_DOUBLE_INDIRECT_INDEX] = dib_blk;
+        dib_created = true;
+    }
+
+    uint32_t dib_table[1024];
+    if (!dib_created) {
+        vfs_status_t s = pread_all(vfs->fd, dib_table, sizeof(dib_table), block_offset(dib_blk));
+        if (s != VFS_OK) { return s; }
+    } else {
+        memset(dib_table, 0, sizeof(dib_table));
+    }
+
+    uint32_t sib_blk = dib_table[dib_idx];
+    bool sib_created = false;
+
+    if (sib_blk == 0) {
+        if (!alloc) {
+            *physical_block = 0;
+            return VFS_OK;
+        }
+        vfs_status_t s = block_alloc_locked(vfs, &sib_blk);
+        if (s != VFS_OK) { return s; }
+        s = block_zero_locked(vfs, sib_blk);
+        if (s != VFS_OK) {
+            (void)block_free_locked(vfs, sib_blk);
+            return s;
+        }
+        dib_table[dib_idx] = sib_blk;
+        s = pwrite_all(vfs->fd, dib_table, sizeof(dib_table), block_offset(dib_blk));
+        if (s != VFS_OK) {
+            (void)block_free_locked(vfs, sib_blk);
+            return s;
+        }
+        sib_created = true;
+    }
+
+    uint32_t sib_table[1024];
+    if (!sib_created) {
+        vfs_status_t s = pread_all(vfs->fd, sib_table, sizeof(sib_table), block_offset(sib_blk));
+        if (s != VFS_OK) { return s; }
+    } else {
+        memset(sib_table, 0, sizeof(sib_table));
+    }
+
+    uint32_t blk = sib_table[sib_idx];
+    if (blk == 0) {
+        if (!alloc) {
+            *physical_block = 0;
+            return VFS_OK;
+        }
+        vfs_status_t s = block_alloc_locked(vfs, &blk);
+        if (s != VFS_OK) { return s; }
+        s = block_zero_locked(vfs, blk);
+        if (s != VFS_OK) {
+            (void)block_free_locked(vfs, blk);
+            return s;
+        }
+        sib_table[sib_idx] = blk;
+        s = pwrite_all(vfs->fd, sib_table, sizeof(sib_table), block_offset(sib_blk));
+        if (s != VFS_OK) {
+            (void)block_free_locked(vfs, blk);
+            return s;
+        }
+        in->block_count++;
+    }
+    *physical_block = blk;
+    return VFS_OK;
+}
+
+/**
+ * Iterates through logical block indexes and recursively releases physical space on disk.
+ * Handles cascading deallocations of direct, single, and double indirect structures.
+ *
+ * @param vfs             Mounted VFS handle.
+ * @param inode_idx       Target file inode index.
+ * @param new_block_count Remaining block count threshold.
+ * @return VFS_OK or VFS_ERR_IO.
+ */
+static vfs_status_t inode_truncate_blocks_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t new_block_count) {
+    vfs_inode_t* in = &vfs->inodes[inode_idx];
+
+    /* 1. Direct Block Range */
+    for (uint32_t b = new_block_count; b < VFS_DIRECT_BLOCKS; b++) {
+        if (in->blocks[b] != 0) {
+            vfs_status_t s = block_free_locked(vfs, in->blocks[b]);
+            if (s != VFS_OK) { return s; }
+            in->blocks[b] = 0;
+            if (in->block_count > 0) { in->block_count--; }
+        }
+    }
+
+    /* 2. Single-Indirect Range */
+    uint32_t sib_blk = in->blocks[VFS_SINGLE_INDIRECT_INDEX];
+    if (sib_blk != 0) {
+        if (new_block_count < VFS_DIRECT_BLOCKS + 1024u) {
+            uint32_t table[1024];
+            vfs_status_t s = pread_all(vfs->fd, table, sizeof(table), block_offset(sib_blk));
+            if (s != VFS_OK) { return s; }
+
+            uint32_t start_sub = (new_block_count > VFS_DIRECT_BLOCKS) ? (new_block_count - VFS_DIRECT_BLOCKS) : 0u;
+            bool dirty = false;
+            for (uint32_t b = start_sub; b < 1024u; b++) {
+                if (table[b] != 0) {
+                    s = block_free_locked(vfs, table[b]);
+                    if (s != VFS_OK) { return s; }
+                    table[b] = 0;
+                    dirty = true;
+                    if (in->block_count > 0) { in->block_count--; }
+                }
+            }
+
+            if (new_block_count <= VFS_DIRECT_BLOCKS) {
+                s = block_free_locked(vfs, sib_blk);
+                if (s != VFS_OK) { return s; }
+                in->blocks[VFS_SINGLE_INDIRECT_INDEX] = 0;
+            } else if (dirty) {
+                s = pwrite_all(vfs->fd, table, sizeof(table), block_offset(sib_blk));
+                if (s != VFS_OK) { return s; }
+            }
+        }
+    }
+
+    /* 3. Double-Indirect Range */
+    uint32_t dib_blk = in->blocks[VFS_DOUBLE_INDIRECT_INDEX];
+    if (dib_blk != 0) {
+        uint32_t single_limit = VFS_DIRECT_BLOCKS + 1024u;
+        if (new_block_count < single_limit + 1024u * 1024u) {
+            uint32_t dib_table[1024];
+            vfs_status_t s = pread_all(vfs->fd, dib_table, sizeof(dib_table), block_offset(dib_blk));
+            if (s != VFS_OK) { return s; }
+
+            uint32_t start_idx = 0;
+            if (new_block_count >= single_limit) { start_idx = (new_block_count - single_limit) / 1024u; }
+
+            bool dib_dirty = false;
+            for (uint32_t d = start_idx; d < 1024u; d++) {
+                uint32_t sib_blk_db = dib_table[d];
+                if (sib_blk_db != 0) {
+                    uint32_t current_sib_base = single_limit + d * 1024u;
+                    if (new_block_count <= current_sib_base) {
+                        /* Free entire child single indirect block + all data leaves */
+                        uint32_t sib_table[1024];
+                        s = pread_all(vfs->fd, sib_table, sizeof(sib_table), block_offset(sib_blk_db));
+                        if (s != VFS_OK) { return s; }
+
+                        for (uint32_t b = 0; b < 1024u; b++) {
+                            if (sib_table[b] != 0) {
+                                s = block_free_locked(vfs, sib_table[b]);
+                                if (s != VFS_OK) { return s; }
+                                if (in->block_count > 0) { in->block_count--; }
+                            }
+                        }
+                        s = block_free_locked(vfs, sib_blk_db);
+                        if (s != VFS_OK) { return s; }
+                        dib_table[d] = 0;
+                        dib_dirty = true;
+                    } else {
+                        /* Boundary single-indirect block inside double indirect array */
+                        uint32_t sib_table[1024];
+                        s = pread_all(vfs->fd, sib_table, sizeof(sib_table), block_offset(sib_blk_db));
+                        if (s != VFS_OK) { return s; }
+
+                        uint32_t start_sub = new_block_count - current_sib_base;
+                        bool sib_dirty = false;
+                        for (uint32_t b = start_sub; b < 1024u; b++) {
+                            if (sib_table[b] != 0) {
+                                s = block_free_locked(vfs, sib_table[b]);
+                                if (s != VFS_OK) { return s; }
+                                sib_table[b] = 0;
+                                sib_dirty = true;
+                                if (in->block_count > 0) { in->block_count--; }
+                            }
+                        }
+                        if (sib_dirty) {
+                            s = pwrite_all(vfs->fd, sib_table, sizeof(sib_table), block_offset(sib_blk_db));
+                            if (s != VFS_OK) { return s; }
+                        }
+                    }
+                }
+            }
+
+            if (new_block_count < single_limit) {
+                s = block_free_locked(vfs, dib_blk);
+                if (s != VFS_OK) { return s; }
+                in->blocks[VFS_DOUBLE_INDIRECT_INDEX] = 0;
+            } else if (dib_dirty) {
+                s = pwrite_all(vfs->fd, dib_table, sizeof(dib_table), block_offset(dib_blk));
+                if (s != VFS_OK) { return s; }
+            }
+        }
+    }
+
+    return VFS_OK;
 }
 
 /* =========================================================================
@@ -256,14 +689,13 @@ static void block_free_locked(vfs_t* vfs, uint32_t blk) {
  */
 static uint32_t inode_find_locked(const vfs_t* vfs, const char* path) {
     for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
-        /* An inode slot is occupied when path[0] is non-zero. */
         if (vfs->inodes[i].path[0] != '\0' && strncmp(vfs->inodes[i].path, path, VFS_MAX_PATH - 1u) == 0) { return i; }
     }
     return INODE_NONE;
 }
 
 /**
- * Finds a free inode slot.
+ * Finds a free inode slot inside the in-memory cache.
  * Caller must hold vfs->lock.
  *
  * @return Index on success, INODE_NONE if the table is full.
@@ -276,18 +708,18 @@ static uint32_t inode_alloc_slot_locked(const vfs_t* vfs) {
 }
 
 /**
- * Frees all data blocks owned by inode @p idx and zeroes the inode.
+ * Frees all data and table blocks owned by inode @p idx and zeroes the entry.
  * Caller must hold vfs->lock.
  *
- * @return VFS_OK or VFS_ERR_IO (from inode_write_locked).
+ * @return VFS_OK or VFS_ERR_IO.
  */
 static vfs_status_t inode_free_locked(vfs_t* vfs, uint32_t idx) {
     assert(idx < VFS_MAX_INODES);
     vfs_inode_t* in = &vfs->inodes[idx];
 
-    for (uint32_t b = 0; b < in->block_count; b++) {
-        block_free_locked(vfs, in->blocks[b]);
-    }
+    vfs_status_t s = inode_truncate_blocks_locked(vfs, idx, 0);
+    if (s != VFS_OK) { return s; }
+
     vfs->super.free_inode_count++;
 
     memset(in, 0, sizeof(*in));
@@ -312,28 +744,6 @@ static open_file_t* oft_get(vfs_t* vfs, vfs_fd_t fd) {
 }
 
 /* =========================================================================
- * Data-block I/O
- * ======================================================================= */
-
-/**
- * Returns the host-file byte offset for logical block @p blk.
- */
-static off_t block_offset(uint32_t blk) {
-    return VFS_DATA_OFFSET + (off_t)blk * (off_t)VFS_BLOCK_SIZE;
-}
-
-/**
- * Zero-fills block @p blk on disk.
- * Caller must hold vfs->lock.
- *
- * @return VFS_OK or VFS_ERR_IO.
- */
-static vfs_status_t block_zero_locked(vfs_t* vfs, uint32_t blk) {
-    static const uint8_t zeros[VFS_BLOCK_SIZE]; /* BSS – zero-initialised */
-    return pwrite_all(vfs->fd, zeros, VFS_BLOCK_SIZE, block_offset(blk));
-}
-
-/* =========================================================================
  * Mount helpers
  * ======================================================================= */
 
@@ -349,7 +759,8 @@ static void oft_init(vfs_t* vfs) {
 }
 
 /**
- * Allocates and partially initialises a vfs_t.
+ * Allocates and partially initialises a vfs_t structure in-memory.
+ * Allocates the heap buffer for the block allocation bitmap.
  *
  * @return Pointer on success, NULL on allocation failure.
  */
@@ -357,8 +768,23 @@ static vfs_t* vfs_alloc(void) {
     vfs_t* v = calloc(1, sizeof(*v));
     if (v == NULL) { return NULL; }
     v->fd = -1;
+    v->alloc_hint = 0;
+
+    v->bitmap = calloc(VFS_BITMAP_WORDS, sizeof(uint32_t));
+    if (v->bitmap == NULL) {
+        free(v);
+        return NULL;
+    }
+
+    v->summary_bitmap = calloc(VFS_SUMMARY_WORDS, sizeof(uint32_t));
+    if (v->summary_bitmap == NULL) {
+        free(v->bitmap);
+        free(v);
+        return NULL;
+    }
 
     if (pthread_mutex_init(&v->lock, NULL) != 0) {
+        free(v->bitmap);
         free(v);
         return NULL;
     }
@@ -376,36 +802,43 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
     vfs_t* vfs = vfs_alloc();
     if (vfs == NULL) { return VFS_ERR_NOMEM; }
 
-    /* Open (or create/truncate) the host file. */
     vfs->fd = open(image_path, O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
     if (vfs->fd < 0) {
         pthread_mutex_destroy(&vfs->lock);
+        free(vfs->bitmap);
         free(vfs);
         return VFS_ERR_IO;
     }
     vfs->readonly = false;
 
-    /* ---- Build the superblock ---- */
+    /*
+     * Initialise the bitmap with all bits set (all blocks free), then
+     * immediately clear bit 0 to permanently reserve physical block 0.
+     * Block 0 is never handed to any file; this ensures that 0 remains a
+     * safe "no block allocated" sentinel throughout all inode block arrays,
+     * indirect tables, and the sparse-hole detection in vfs_fread.
+     */
+    memset(vfs->bitmap, 0xFF, VFS_BITMAP_WORDS * sizeof(uint32_t));
+    /* After setting vfs->bitmap with 0xFF... */
+    memset(vfs->summary_bitmap, 0xFF, VFS_SUMMARY_WORDS * sizeof(uint32_t));
+    bitmap_set_used(vfs, 0u);
+
     vfs->super = (vfs_super_t){
         .magic = VFS_MAGIC,
         .version = VFS_VERSION,
         .block_size = VFS_BLOCK_SIZE,
         .max_inodes = VFS_MAX_INODES,
         .total_blocks = VFS_TOTAL_BLOCKS,
-        .free_block_count = VFS_TOTAL_BLOCKS,
+        .free_block_count = VFS_TOTAL_BLOCKS - 1u, /* block 0 is reserved */
         .free_inode_count = VFS_MAX_INODES,
+        .bitmap_words = VFS_BITMAP_WORDS,
     };
 
-    /* All bitmap bits set to 1 == all blocks free. */
-    memset(vfs->super.bitmap, 0xFF, sizeof(vfs->super.bitmap));
-
-    /* ---- Write superblock region (full VFS_SUPERBLOCK_SIZE bytes) ---- */
+    /* Superblock block region persist */
     {
-        /* Write the struct itself. */
         vfs_status_t s = pwrite_all(vfs->fd, &vfs->super, sizeof(vfs->super), (off_t)0);
         if (s != VFS_OK) { goto io_error; }
 
-        /* Zero the remaining padding so the region is fully initialised. */
         size_t pad = VFS_SUPERBLOCK_SIZE - sizeof(vfs->super);
         if (pad > 0) {
             uint8_t* zeros = calloc(1, pad);
@@ -419,7 +852,13 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
         }
     }
 
-    /* ---- Write inode table (all zeroes — no files yet) ---- */
+    /* Bitmap block region persist */
+    {
+        vfs_status_t s = bitmap_write_locked(vfs);
+        if (s != VFS_OK) { goto io_error; }
+    }
+
+    /* Inodes table block region persist */
     {
         vfs_status_t s = pwrite_all(vfs->fd, vfs->inodes, sizeof(vfs->inodes), VFS_INODE_TABLE_OFFSET);
         if (s != VFS_OK) { goto io_error; }
@@ -443,30 +882,59 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
     vfs->fd = open(image_path, oflags, (mode_t)0);
     if (vfs->fd < 0) {
         pthread_mutex_destroy(&vfs->lock);
+        free(vfs->bitmap);
         free(vfs);
         return VFS_ERR_IO;
     }
     vfs->readonly = readonly;
 
-    /* ---- Read superblock ---- */
+    /* Validate Superblock */
     {
         vfs_status_t s = pread_all(vfs->fd, &vfs->super, sizeof(vfs->super), (off_t)0);
         if (s != VFS_OK) { goto io_error; }
     }
 
-    /* ---- Validate magic and version ---- */
     if (vfs->super.magic != VFS_MAGIC || vfs->super.version != VFS_VERSION || vfs->super.block_size != VFS_BLOCK_SIZE ||
-        vfs->super.max_inodes != VFS_MAX_INODES || vfs->super.total_blocks != VFS_TOTAL_BLOCKS) {
+        vfs->super.max_inodes != VFS_MAX_INODES || vfs->super.total_blocks != VFS_TOTAL_BLOCKS ||
+        vfs->super.bitmap_words != VFS_BITMAP_WORDS) {
         pthread_mutex_destroy(&vfs->lock);
         close(vfs->fd);
+        free(vfs->bitmap);
         free(vfs);
         return VFS_ERR_CORRUPT;
     }
 
-    /* ---- Read inode table ---- */
+    /* Read Bitmap */
+    {
+        vfs_status_t s = bitmap_read_locked(vfs);
+        if (s != VFS_OK) { goto io_error; }
+    }
+
+    /* Populate summary bitmap */
+    memset(vfs->summary_bitmap, 0, VFS_SUMMARY_WORDS * sizeof(uint32_t));
+    for (uint32_t w = 0; w < VFS_BITMAP_WORDS; w++) {
+        if (vfs->bitmap[w] != 0) {
+            uint32_t sw = w / 32u;
+            uint32_t sbit = w % 32u;
+            vfs->summary_bitmap[sw] |= (1u << sbit);
+        }
+    }
+
+    /* Read Inodes Table */
     {
         vfs_status_t s = pread_all(vfs->fd, vfs->inodes, sizeof(vfs->inodes), VFS_INODE_TABLE_OFFSET);
         if (s != VFS_OK) { goto io_error; }
+    }
+
+    /* Set alloc hints */
+    {
+        vfs->alloc_hint = 0;
+        for (uint32_t w = 0; w < VFS_BITMAP_WORDS; w++) {
+            if (vfs->bitmap[w] != 0) {
+                vfs->alloc_hint = w;
+                break;
+            }
+        }
     }
 
     *out_vfs = vfs;
@@ -475,6 +943,7 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
 io_error:
     pthread_mutex_destroy(&vfs->lock);
     close(vfs->fd);
+    free(vfs->bitmap);
     free(vfs);
     return VFS_ERR_IO;
 }
@@ -482,10 +951,10 @@ io_error:
 void vfs_close(vfs_t* vfs) {
     if (vfs == NULL) { return; }
 
-    /* Best-effort flush; errors are swallowed on close. */
     if (!vfs->readonly && vfs->fd >= 0) {
         pthread_mutex_lock(&vfs->lock);
         (void)super_write_locked(vfs);
+        (void)bitmap_write_locked(vfs);
         (void)inodes_write_locked(vfs);
         pthread_mutex_unlock(&vfs->lock);
     }
@@ -496,16 +965,19 @@ void vfs_close(vfs_t* vfs) {
     }
 
     pthread_mutex_destroy(&vfs->lock);
+    if (vfs->bitmap) { free(vfs->bitmap); }
+    if (vfs->summary_bitmap) { free(vfs->summary_bitmap); }
     free(vfs);
 }
 
 vfs_status_t vfs_sync(vfs_t* vfs) {
     if (vfs == NULL) { return VFS_ERR_INVAL; }
-    if (vfs->readonly) { return VFS_OK; /* Nothing to flush. */ }
+    if (vfs->readonly) { return VFS_OK; }
 
     pthread_mutex_lock(&vfs->lock);
 
     vfs_status_t s = super_write_locked(vfs);
+    if (s == VFS_OK) { s = bitmap_write_locked(vfs); }
     if (s == VFS_OK) { s = inodes_write_locked(vfs); }
 
     pthread_mutex_unlock(&vfs->lock);
@@ -527,17 +999,13 @@ vfs_fd_t vfs_fopen(vfs_t* vfs, const char* path, unsigned int flags) {
     vfs_status_t rc;
     uint32_t inode_idx = inode_find_locked(vfs, path);
 
-    /* ---- Handle VFS_O_CREAT / VFS_O_EXCL ---- */
     if (flags & VFS_O_CREAT) {
         if (inode_idx != INODE_NONE) {
-            /* File already exists. */
             if (flags & VFS_O_EXCL) {
                 rc = VFS_ERR_EXISTS;
                 goto out;
             }
-            /* Fall through – open the existing file. */
         } else {
-            /* Allocate a new inode. */
             inode_idx = inode_alloc_slot_locked(vfs);
             if (inode_idx == INODE_NONE) {
                 rc = VFS_ERR_NOSPACE;
@@ -557,20 +1025,17 @@ vfs_fd_t vfs_fopen(vfs_t* vfs, const char* path, unsigned int flags) {
 
             rc = inode_write_locked(vfs, inode_idx);
             if (rc != VFS_OK) {
-                /* Roll back the inode slot. */
                 memset(in, 0, sizeof(*in));
                 goto out;
             }
         }
     } else {
-        /* No O_CREAT – the file must exist. */
         if (inode_idx == INODE_NONE) {
             rc = VFS_ERR_NOTFOUND;
             goto out;
         }
     }
 
-    /* ---- Find a free slot in the open-file table ---- */
     vfs_fd_t fd = -1;
     for (uint32_t i = 0; i < VFS_MAX_OPEN_FILES; i++) {
         if (vfs->oft[i].inode_idx == OFT_FREE) {
@@ -583,27 +1048,24 @@ vfs_fd_t vfs_fopen(vfs_t* vfs, const char* path, unsigned int flags) {
         goto out;
     }
 
-    /* ---- Handle VFS_O_TRUNC ---- */
     if ((flags & VFS_O_TRUNC) && (flags & (VFS_O_WRONLY | VFS_O_RDWR))) {
-        vfs_inode_t* in = &vfs->inodes[inode_idx];
-        for (uint32_t b = 0; b < in->block_count; b++) {
-            block_free_locked(vfs, in->blocks[b]);
+        vfs_status_t s = inode_truncate_blocks_locked(vfs, inode_idx, 0);
+        if (s != VFS_OK) {
+            rc = s;
+            goto out;
         }
-        in->block_count = 0;
+        vfs_inode_t* in = &vfs->inodes[inode_idx];
         in->size = 0;
         in->modified_at = (uint64_t)time(NULL);
         rc = inode_write_locked(vfs, inode_idx);
         if (rc != VFS_OK) { goto out; }
     }
 
-    /* ---- Fill in the OFT entry ---- */
     vfs->oft[(unsigned int)fd].inode_idx = (int)inode_idx;
     vfs->oft[(unsigned int)fd].flags = flags;
-
-    /* For append mode, cursor starts at EOF; otherwise at 0. */
     vfs->oft[(unsigned int)fd].pos = (flags & VFS_O_APPEND) ? (off_t)vfs->inodes[inode_idx].size : (off_t)0;
 
-    rc = (vfs_status_t)fd; /* Returning fd value >= 0 signals success. */
+    rc = (vfs_status_t)fd;
 
 out:
     pthread_mutex_unlock(&vfs->lock);
@@ -621,7 +1083,6 @@ vfs_status_t vfs_fclose(vfs_t* vfs, vfs_fd_t fd) {
         return VFS_ERR_BADFD;
     }
 
-    /* Mark the slot free. */
     of->inode_idx = OFT_FREE;
     of->pos = 0;
     of->flags = 0;
@@ -644,7 +1105,6 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
         return VFS_ERR_BADFD;
     }
 
-    /* A write-only descriptor cannot be read. */
     if ((of->flags & VFS_O_WRONLY) && !(of->flags & VFS_O_RDWR)) {
         pthread_mutex_unlock(&vfs->lock);
         return VFS_ERR_INVAL;
@@ -653,9 +1113,7 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
     vfs_inode_t* in = &vfs->inodes[(uint32_t)of->inode_idx];
     uint64_t fsize = in->size;
 
-    /* Clamp to available bytes. */
     if ((uint64_t)of->pos >= fsize) {
-        /* At or past EOF. */
         pthread_mutex_unlock(&vfs->lock);
         return VFS_OK;
     }
@@ -672,13 +1130,19 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
         size_t can_read = VFS_BLOCK_SIZE - block_off;
         if (can_read > remaining) { can_read = remaining; }
 
-        if (block_idx >= in->block_count) {
-            /* Sparse region: return zeroes. */
+        uint32_t blk = 0;
+        vfs_status_t s = vfs_bmap_locked(vfs, (uint32_t)of->inode_idx, block_idx, false, &blk);
+        if (s != VFS_OK) {
+            pthread_mutex_unlock(&vfs->lock);
+            return s;
+        }
+
+        if (blk == 0) {
+            /* Sparse hole: physical block was never allocated; return zeroes. */
             memset(dst, 0, can_read);
         } else {
-            uint32_t blk = in->blocks[block_idx];
             off_t off = block_offset(blk) + (off_t)block_off;
-            vfs_status_t s = pread_all(vfs->fd, dst, can_read, off);
+            s = pread_all(vfs->fd, dst, can_read, off);
             if (s != VFS_OK) {
                 pthread_mutex_unlock(&vfs->lock);
                 return s;
@@ -713,13 +1177,11 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
         return VFS_ERR_BADFD;
     }
 
-    /* Must be opened with write permission. */
     if (!(of->flags & (VFS_O_WRONLY | VFS_O_RDWR))) {
         pthread_mutex_unlock(&vfs->lock);
         return VFS_ERR_INVAL;
     }
 
-    /* In append mode, always write at the current end of file. */
     if (of->flags & VFS_O_APPEND) { of->pos = (off_t)vfs->inodes[(uint32_t)of->inode_idx].size; }
 
     vfs_inode_t* in = &vfs->inodes[(uint32_t)of->inode_idx];
@@ -734,25 +1196,10 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
         size_t can_write = VFS_BLOCK_SIZE - block_off;
         if (can_write > remaining) { can_write = remaining; }
 
-        /* Allocate a new block if needed. */
-        if (block_idx >= in->block_count) {
-            if (in->block_count >= VFS_MAX_BLOCKS_PER_FILE) {
-                rc = VFS_ERR_OVERFLOW;
-                break;
-            }
-            uint32_t new_blk;
-            rc = block_alloc_locked(vfs, &new_blk);
-            if (rc != VFS_OK) { break; }
-            /* Zero out the freshly-allocated block on disk. */
-            rc = block_zero_locked(vfs, new_blk);
-            if (rc != VFS_OK) {
-                block_free_locked(vfs, new_blk);
-                break;
-            }
-            in->blocks[in->block_count++] = new_blk;
-        }
+        uint32_t blk = 0;
+        rc = vfs_bmap_locked(vfs, (uint32_t)of->inode_idx, block_idx, true, &blk);
+        if (rc != VFS_OK) { break; }
 
-        uint32_t blk = in->blocks[block_idx];
         off_t off = block_offset(blk) + (off_t)block_off;
         rc = pwrite_all(vfs->fd, src, can_write, off);
         if (rc != VFS_OK) { break; }
@@ -765,12 +1212,10 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
     size_t written = count - remaining;
     *bytes_written = written;
 
-    /* Extend the logical file size if we wrote beyond the old end. */
     if ((uint64_t)cur_pos > in->size) { in->size = (uint64_t)cur_pos; }
     in->modified_at = (uint64_t)time(NULL);
     of->pos = cur_pos;
 
-    /* Persist the updated inode; report I/O errors over earlier errors. */
     vfs_status_t ws = inode_write_locked(vfs, (uint32_t)of->inode_idx);
     if (ws != VFS_OK && rc == VFS_OK) { rc = ws; }
 
@@ -853,34 +1298,32 @@ vfs_status_t vfs_truncate(vfs_t* vfs, const char* path, uint64_t length) {
     vfs_status_t rc = VFS_OK;
 
     if (length < in->size) {
-        /* ---- Shrink: free blocks beyond the new size ---- */
         uint32_t new_block_count = (uint32_t)((length + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
 
-        for (uint32_t b = new_block_count; b < in->block_count; b++) {
-            block_free_locked(vfs, in->blocks[b]);
-            in->blocks[b] = 0;
-        }
-        in->block_count = new_block_count;
+        rc = inode_truncate_blocks_locked(vfs, idx, new_block_count);
+        if (rc != VFS_OK) { goto out; }
         in->size = length;
 
-        /* If the new size falls in the middle of a block, zero the tail
-         * of that last block so reads past the new EOF return zeroes. */
         if (new_block_count > 0 && (length % VFS_BLOCK_SIZE) != 0) {
-            uint32_t last_blk = in->blocks[new_block_count - 1u];
-            uint32_t tail_off = (uint32_t)(length % VFS_BLOCK_SIZE);
-            uint32_t tail_len = VFS_BLOCK_SIZE - tail_off;
-            off_t write_off = block_offset(last_blk) + (off_t)tail_off;
-            uint8_t* zeros = calloc(1, tail_len);
-            if (zeros == NULL) {
-                rc = VFS_ERR_NOMEM;
-                goto out;
-            }
-            rc = pwrite_all(vfs->fd, zeros, tail_len, write_off);
-            free(zeros);
+            uint32_t last_blk = 0;
+            rc = vfs_bmap_locked(vfs, idx, new_block_count - 1u, false, &last_blk);
             if (rc != VFS_OK) { goto out; }
+
+            if (last_blk != 0) {
+                uint32_t tail_off = (uint32_t)(length % VFS_BLOCK_SIZE);
+                uint32_t tail_len = VFS_BLOCK_SIZE - tail_off;
+                off_t write_off = block_offset(last_blk) + (off_t)tail_off;
+                uint8_t* zeros = calloc(1, tail_len);
+                if (zeros == NULL) {
+                    rc = VFS_ERR_NOMEM;
+                    goto out;
+                }
+                rc = pwrite_all(vfs->fd, zeros, tail_len, write_off);
+                free(zeros);
+                if (rc != VFS_OK) { goto out; }
+            }
         }
     } else if (length > in->size) {
-        /* ---- Extend: allocate blocks and zero-fill ---- */
         uint32_t new_block_count = (uint32_t)((length + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
 
         if (new_block_count > VFS_MAX_BLOCKS_PER_FILE) {
@@ -888,22 +1331,13 @@ vfs_status_t vfs_truncate(vfs_t* vfs, const char* path, uint64_t length) {
             goto out;
         }
 
-        /* Allocate any new blocks needed. */
         for (uint32_t b = in->block_count; b < new_block_count; b++) {
-            uint32_t new_blk;
-            rc = block_alloc_locked(vfs, &new_blk);
+            uint32_t new_blk = 0;
+            rc = vfs_bmap_locked(vfs, idx, b, true, &new_blk);
             if (rc != VFS_OK) { goto out; }
-            rc = block_zero_locked(vfs, new_blk);
-            if (rc != VFS_OK) {
-                block_free_locked(vfs, new_blk);
-                goto out;
-            }
-            in->blocks[b] = new_blk;
-            in->block_count++;
         }
         in->size = length;
     }
-    /* length == in->size: no-op. */
 
     in->modified_at = (uint64_t)time(NULL);
     rc = inode_write_locked(vfs, idx);
@@ -950,7 +1384,6 @@ vfs_status_t vfs_unlink(vfs_t* vfs, const char* path) {
         return VFS_ERR_NOTFOUND;
     }
 
-    /* Close any open descriptors pointing at this inode. */
     for (uint32_t i = 0; i < VFS_MAX_OPEN_FILES; i++) {
         if (vfs->oft[i].inode_idx == (int)idx) {
             vfs->oft[i].inode_idx = OFT_FREE;
@@ -982,7 +1415,6 @@ bool vfs_exists(vfs_t* vfs, const char* path) {
 void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* userdata) {
     if (vfs == NULL || callback == NULL) { return; }
 
-    /* Treat NULL or empty prefix as "match everything". */
     bool match_all = (prefix == NULL || prefix[0] == '\0' || (prefix[0] == '/' && prefix[1] == '\0'));
     size_t prefix_len = match_all ? 0u : strlen(prefix);
 
@@ -990,7 +1422,7 @@ void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* user
 
     for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
         const vfs_inode_t* in = &vfs->inodes[i];
-        if (in->path[0] == '\0') { continue; /* Free slot. */ }
+        if (in->path[0] == '\0') { continue; }
 
         if (!match_all && strncmp(in->path, prefix, prefix_len) != 0) { continue; }
 
@@ -1003,8 +1435,6 @@ void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* user
         strncpy(st.path, in->path, VFS_MAX_PATH - 1u);
         st.path[VFS_MAX_PATH - 1u] = '\0';
 
-        /* Release the lock around the callback to avoid re-entrancy
-         * deadlocks if the caller calls back into the VFS. */
         pthread_mutex_unlock(&vfs->lock);
         bool cont = callback(in->path, &st, userdata);
         pthread_mutex_lock(&vfs->lock);
@@ -1020,11 +1450,9 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath) {
     if (oldpath[0] == '\0' || newpath[0] == '\0') { return VFS_ERR_INVAL; }
     if (vfs->readonly) { return VFS_ERR_READONLY; }
 
-    /* newpath must fit in the inode's fixed path buffer. */
     size_t new_len = strlen(newpath);
     if (new_len >= VFS_MAX_PATH) { return VFS_ERR_INVAL; }
 
-    /* No-op short circuit — compare before acquiring the lock. */
     if (strncmp(oldpath, newpath, VFS_MAX_PATH) == 0) { return VFS_OK; }
 
     pthread_mutex_lock(&vfs->lock);
@@ -1037,14 +1465,8 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath) {
         goto out;
     }
 
-    /* ---- Handle destination ---- */
     uint32_t dst_idx = inode_find_locked(vfs, newpath);
     if (dst_idx != INODE_NONE && dst_idx != src_idx) {
-        /*
-         * Destination exists and is a different inode.  Evict any open
-         * file descriptors pointing at it, free its blocks, and zero its
-         * slot — identical to vfs_unlink, minus the lock acquire.
-         */
         for (uint32_t i = 0; i < VFS_MAX_OPEN_FILES; i++) {
             if (vfs->oft[i].inode_idx == (int)dst_idx) {
                 vfs->oft[i].inode_idx = OFT_FREE;
@@ -1053,21 +1475,18 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath) {
             }
         }
 
-        /* Step A: persist the zeroed victim inode before touching the source. */
         rc = inode_free_locked(vfs, dst_idx);
         if (rc != VFS_OK) { goto out; }
     }
 
-    /* ---- Step B: update the source inode's path ---- */
     vfs_inode_t* src = &vfs->inodes[src_idx];
     memset(src->path, 0, VFS_MAX_PATH);
-    memcpy(src->path, newpath, new_len); /* memcpy: length already validated */
+    memcpy(src->path, newpath, new_len);
     src->modified_at = (uint64_t)time(NULL);
 
     rc = inode_write_locked(vfs, src_idx);
     if (rc != VFS_OK) { goto out; }
 
-    /* ---- Step C: persist updated superblock free-counts ---- */
     rc = super_write_locked(vfs);
 
 out:
@@ -1113,7 +1532,6 @@ const char* vfs_strerror(vfs_status_t status) {
 void vfs_dump(const vfs_t* vfs, FILE* out) {
     if (vfs == NULL || out == NULL) { return; }
 
-    /* Cast away const for the mutex — the lock is logically const here. */
     vfs_t* v = (vfs_t*)(uintptr_t)vfs;
     pthread_mutex_lock(&v->lock);
 
@@ -1127,8 +1545,8 @@ void vfs_dump(const vfs_t* vfs, FILE* out) {
     fprintf(out, "  total_blocks     : %u\n", sb->total_blocks);
     fprintf(out, "  free_block_count : %u\n", sb->free_block_count);
     fprintf(out, "  free_inode_count : %u\n", sb->free_inode_count);
+    fprintf(out, "  bitmap_words     : %u\n", sb->bitmap_words);
 
-    /* Count actually-used inodes for a sanity cross-check. */
     uint32_t used_inodes = 0;
     for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
         if (vfs->inodes[i].path[0] != '\0') { used_inodes++; }
