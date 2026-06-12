@@ -509,8 +509,14 @@ static bool test_max_open_files_limit(void) {
  * ======================================================================= */
 
 /**
+ * @brief Configurable benchmark parameters
+ */
+#define BENCH_CHUNK_SIZE     (256 * 1024)           /* 256 KiB chunks */
+#define BENCH_TOTAL_SIZE     (512ULL * 1024 * 1024) /* 512 MiB total */
+#define BENCH_PROGRESS_EVERY (64ULL * 1024 * 1024)  /* Print progress every 64 MiB */
+
+/**
  * @brief Measures the throughput of sequential write operations.
- *        Generates a 32 MiB file in 64 KiB chunks to test block runs.
  */
 static bool benchmark_write_throughput(void) {
     vfs_t* vfs = NULL;
@@ -521,8 +527,8 @@ static bool benchmark_write_throughput(void) {
     vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_CREAT | VFS_O_WRONLY);
     VFS_ASSERT_FD_OK(fd);
 
-    size_t chunk_size = 64 * 1024;        /* 64 KiB */
-    size_t total_size = 32 * 1024 * 1024; /* 32 MiB */
+    size_t chunk_size = BENCH_CHUNK_SIZE;
+    size_t total_size = BENCH_TOTAL_SIZE;
     uint8_t* buffer = malloc(chunk_size);
     VFS_ASSERT_TRUE(buffer != NULL);
     memset(buffer, 0x5A, chunk_size);
@@ -531,16 +537,38 @@ static bool benchmark_write_throughput(void) {
     VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
 
     size_t bytes_written_total = 0;
+    size_t last_progress = 0;
+
     while (bytes_written_total < total_size) {
+        size_t remaining = total_size - bytes_written_total;
+        size_t write_size = (remaining < chunk_size) ? remaining : chunk_size;
+
         size_t written = 0;
-        vfs_status_t s = vfs_fwrite(vfs, fd, buffer, chunk_size, &written);
-        if (s != VFS_OK || written != chunk_size) {
+        vfs_status_t s = vfs_fwrite(vfs, fd, buffer, write_size, &written);
+        if (s != VFS_OK || written != write_size) {
+            printf("\n    Write FAILED at %zu / %zu MiB\n", bytes_written_total / (1024 * 1024),
+                   total_size / (1024 * 1024));
             free(buffer);
             vfs_fclose(vfs, fd);
             vfs_close(vfs);
             return false;
         }
         bytes_written_total += written;
+
+        /* Progress indicator */
+        if (bytes_written_total - last_progress >= BENCH_PROGRESS_EVERY) {
+            last_progress = bytes_written_total;
+            double progress = (double)bytes_written_total / (double)total_size * 100.0;
+            double elapsed = 0.0;
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                elapsed = (double)(now.tv_sec - start.tv_sec) + (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+            }
+            double current_throughput = (double)(bytes_written_total / (1024.0 * 1024.0)) / elapsed;
+            printf("    Write: %.1f%% (%5zu MiB) - %.1f sec, %.0f MiB/s\r", progress,
+                   bytes_written_total / (1024 * 1024), elapsed, current_throughput);
+            fflush(stdout);
+        }
     }
 
     VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
@@ -550,7 +578,7 @@ static bool benchmark_write_throughput(void) {
     double mib = (double)total_size / (1024.0 * 1024.0);
     double throughput = mib / seconds;
 
-    printf("\n  Sequential Write Benchmark:\n");
+    printf("\n\n  Sequential Write Benchmark:\n");
     printf("    Write Size   : %.2f MiB\n", mib);
     printf("    Chunk Size   : %zu KiB\n", chunk_size / 1024);
     printf("    Elapsed Time : %.4f seconds\n", seconds);
@@ -563,19 +591,17 @@ static bool benchmark_write_throughput(void) {
 
 /**
  * @brief Measures the throughput of sequential read operations.
- *        Reads the 32 MiB file created by the write benchmark.
  */
 static bool benchmark_read_throughput(void) {
     vfs_t* vfs = NULL;
-    /* Open the existing image containing /bench.bin from the write benchmark */
     VFS_ASSERT_STATUS_OK(vfs_open(TEST_IMAGE, true, &vfs));
 
     const char* path = "/bench.bin";
     vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
     VFS_ASSERT_FD_OK(fd);
 
-    size_t chunk_size = 64 * 1024;        /* 64 KiB */
-    size_t total_size = 32 * 1024 * 1024; /* 32 MiB */
+    size_t chunk_size = BENCH_CHUNK_SIZE;
+    size_t total_size = BENCH_TOTAL_SIZE;
     uint8_t* buffer = malloc(chunk_size);
     VFS_ASSERT_TRUE(buffer != NULL);
 
@@ -583,16 +609,38 @@ static bool benchmark_read_throughput(void) {
     VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
 
     size_t bytes_read_total = 0;
+    size_t last_progress = 0;
+
     while (bytes_read_total < total_size) {
+        size_t remaining = total_size - bytes_read_total;
+        size_t read_size = (remaining < chunk_size) ? remaining : chunk_size;
+
         size_t read_bytes = 0;
-        vfs_status_t s = vfs_fread(vfs, fd, buffer, chunk_size, &read_bytes);
-        if (s != VFS_OK || read_bytes != chunk_size) {
+        vfs_status_t s = vfs_fread(vfs, fd, buffer, read_size, &read_bytes);
+        if (s != VFS_OK || read_bytes != read_size) {
+            printf("\n    Read FAILED at %zu / %zu MiB\n", bytes_read_total / (1024 * 1024),
+                   total_size / (1024 * 1024));
             free(buffer);
             vfs_fclose(vfs, fd);
             vfs_close(vfs);
             return false;
         }
         bytes_read_total += read_bytes;
+
+        /* Progress indicator */
+        if (bytes_read_total - last_progress >= BENCH_PROGRESS_EVERY) {
+            last_progress = bytes_read_total;
+            double progress = (double)bytes_read_total / (double)total_size * 100.0;
+            double elapsed = 0.0;
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                elapsed = (double)(now.tv_sec - start.tv_sec) + (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+            }
+            double current_throughput = (double)(bytes_read_total / (1024.0 * 1024.0)) / elapsed;
+            printf("    Read:  %.1f%% (%5zu MiB) - %.1f sec, %.0f MiB/s\r", progress, bytes_read_total / (1024 * 1024),
+                   elapsed, current_throughput);
+            fflush(stdout);
+        }
     }
 
     VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
@@ -602,11 +650,11 @@ static bool benchmark_read_throughput(void) {
     double mib = (double)total_size / (1024.0 * 1024.0);
     double throughput = mib / seconds;
 
-    printf("\n  Sequential Read Benchmark:\n");
+    printf("\n\n  Sequential Read Benchmark:\n");
     printf("    Read Size    : %.2f MiB\n", mib);
     printf("    Chunk Size   : %zu KiB\n", chunk_size / 1024);
     printf("    Elapsed Time : %.4f seconds\n", seconds);
-    printf("    Throughput   : %.2f MiB/sec\n\n", throughput);
+    printf("    Throughput   : %.2f MiB/sec\n", throughput);
 
     free(buffer);
     vfs_close(vfs);
