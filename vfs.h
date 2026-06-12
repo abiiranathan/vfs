@@ -40,6 +40,7 @@
 #ifndef VFS_H
 #define VFS_H
 
+#include <assert.h>   /* static_assert */
 #include <inttypes.h> /* PRIu64, etc.                  */
 #include <stdbool.h>  /* bool                          */
 #include <stddef.h>   /* size_t                        */
@@ -47,7 +48,6 @@
 #include <stdio.h>    /* FILE*                         */
 #include <sys/types.h>/* off_t                         */
 #include <time.h>     /* time_t                        */
-
 /* -------------------------------------------------------------------------
  * Compile-time tunables
  * ---------------------------------------------------------------------- */
@@ -159,7 +159,7 @@ typedef enum {
  * On-disk inode. Stores metadata and block pointers.
  * A zero `path[0]` byte means the slot is free.
  */
-typedef struct {
+typedef struct __attribute__((packed)) {
     char path[VFS_MAX_PATH];                      /**< Absolute virtual path, NUL-terminated. */
     uint64_t size;                                /**< Logical file size in bytes.             */
     uint64_t created_at;                          /**< Creation timestamp (Unix seconds).      */
@@ -168,12 +168,6 @@ typedef struct {
     uint32_t blocks[VFS_INODE_BLOCKS_ARRAY_SIZE]; /**< Physical block addresses (direct/ind).  */
     uint8_t _pad[4];                              /**< Explicit padding for alignment.         */
 } vfs_inode_t;
-
-#if !defined(__cplusplus)
-_Static_assert(sizeof(vfs_inode_t) == 1312, "vfs_inode_t size must be exactly 1312 bytes");
-#else
-static_assert(sizeof(vfs_inode_t) <= VFS_SUPERBLOCK_SIZE);
-#endif
 
 /**
  * On-disk superblock. Always lives at offset 0 of the image file.
@@ -190,12 +184,6 @@ typedef struct {
     uint32_t bitmap_words;     /**< Number of words in the bitmap.   */
     uint8_t _reserved[32];     /**< Future use/padding.              */
 } vfs_super_t;
-
-#if !defined(__cplusplus)
-_Static_assert(sizeof(vfs_super_t) <= VFS_SUPERBLOCK_SIZE, "vfs_super_t exceeds VFS_SUPERBLOCK_SIZE");
-#else
-static_assert(sizeof(vfs_super_t) <= VFS_SUPERBLOCK_SIZE);
-#endif
 
 /* -------------------------------------------------------------------------
  * Runtime handles (opaque to callers)
@@ -499,6 +487,11 @@ static inline vfs_status_t append_vfs_file(vfs_t* vfs, const char* path, const v
     if (status != VFS_OK) { return status; }
     return (written == len) ? VFS_OK : VFS_ERR_IO;
 }
+
+static_assert(sizeof(vfs_inode_t) == 1312, "vfs_inode_t size must be exactly 1312 bytes");
+static_assert(offsetof(vfs_inode_t, size) == 256, "layout changed");
+static_assert(offsetof(vfs_inode_t, block_count) == 280, "layout changed");
+static_assert(sizeof(vfs_super_t) <= VFS_SUPERBLOCK_SIZE, "vfs_super_t exceeds VFS_SUPERBLOCK_SIZE");
 
 #if defined(__cplusplus)
 }

@@ -894,14 +894,30 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
         if (s != VFS_OK) { goto io_error; }
     }
 
-    if (vfs->super.magic != VFS_MAGIC || vfs->super.version != VFS_VERSION || vfs->super.block_size != VFS_BLOCK_SIZE ||
-        vfs->super.max_inodes != VFS_MAX_INODES || vfs->super.total_blocks != VFS_TOTAL_BLOCKS ||
-        vfs->super.bitmap_words != VFS_BITMAP_WORDS) {
-        pthread_mutex_destroy(&vfs->lock);
-        close(vfs->fd);
-        free(vfs->bitmap);
-        free(vfs);
-        return VFS_ERR_CORRUPT;
+    struct {
+        uint32_t disk;
+        uint32_t expected;
+        const char* field;
+    } checks[] = {
+        {vfs->super.magic, VFS_MAGIC, "magic"},
+        {vfs->super.version, VFS_VERSION, "version"},
+        {vfs->super.block_size, VFS_BLOCK_SIZE, "block_size"},
+        {vfs->super.max_inodes, VFS_MAX_INODES, "max_inodes"},
+        {vfs->super.total_blocks, VFS_TOTAL_BLOCKS, "total_blocks"},
+        {vfs->super.bitmap_words, VFS_BITMAP_WORDS, "bitmap_words"},
+    };
+
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        if (checks[i].disk != checks[i].expected) {
+            fprintf(stderr, "VFS corrupt: field '%s' on disk is 0x%08X, expected 0x%08X\n", checks[i].field,
+                    checks[i].disk, checks[i].expected);
+
+            pthread_mutex_destroy(&vfs->lock);
+            close(vfs->fd);
+            free(vfs->bitmap);
+            free(vfs);
+            return VFS_ERR_CORRUPT;
+        }
     }
 
     /* Read Bitmap */
