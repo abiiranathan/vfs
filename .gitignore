@@ -6,3 +6,6 @@ vfs_demo
 *.vfs
 vfs-pack
 vfs-cli
+bin
+obj
+lib
