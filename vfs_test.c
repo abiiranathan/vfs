@@ -1,6 +1,6 @@
 /**
  * @file vfs_test.c
- * @brief Comprehensive test suite verifying indirect addressing and allocation boundaries.
+ * @brief Comprehensive test suite verifying indirect addressing, allocation boundaries, and I/O throughput.
  */
 
 #include "vfs.h"
@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TEST_IMAGE "test_system.vfs"
@@ -503,6 +504,115 @@ static bool test_max_open_files_limit(void) {
     return true;
 }
 
+/* =========================================================================
+ * Quantitative Benchmarks
+ * ======================================================================= */
+
+/**
+ * @brief Measures the throughput of sequential write operations.
+ *        Generates a 32 MiB file in 64 KiB chunks to test block runs.
+ */
+static bool benchmark_write_throughput(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    const char* path = "/bench.bin";
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_CREAT | VFS_O_WRONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    size_t chunk_size = 64 * 1024;        /* 64 KiB */
+    size_t total_size = 32 * 1024 * 1024; /* 32 MiB */
+    uint8_t* buffer = malloc(chunk_size);
+    VFS_ASSERT_TRUE(buffer != NULL);
+    memset(buffer, 0x5A, chunk_size);
+
+    struct timespec start, end;
+    VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+
+    size_t bytes_written_total = 0;
+    while (bytes_written_total < total_size) {
+        size_t written = 0;
+        vfs_status_t s = vfs_fwrite(vfs, fd, buffer, chunk_size, &written);
+        if (s != VFS_OK || written != chunk_size) {
+            free(buffer);
+            vfs_fclose(vfs, fd);
+            vfs_close(vfs);
+            return false;
+        }
+        bytes_written_total += written;
+    }
+
+    VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+
+    double seconds = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
+    double mib = (double)total_size / (1024.0 * 1024.0);
+    double throughput = mib / seconds;
+
+    printf("\n  Sequential Write Benchmark:\n");
+    printf("    Write Size   : %.2f MiB\n", mib);
+    printf("    Chunk Size   : %zu KiB\n", chunk_size / 1024);
+    printf("    Elapsed Time : %.4f seconds\n", seconds);
+    printf("    Throughput   : %.2f MiB/sec\n", throughput);
+
+    free(buffer);
+    vfs_close(vfs);
+    return true;
+}
+
+/**
+ * @brief Measures the throughput of sequential read operations.
+ *        Reads the 32 MiB file created by the write benchmark.
+ */
+static bool benchmark_read_throughput(void) {
+    vfs_t* vfs = NULL;
+    /* Open the existing image containing /bench.bin from the write benchmark */
+    VFS_ASSERT_STATUS_OK(vfs_open(TEST_IMAGE, true, &vfs));
+
+    const char* path = "/bench.bin";
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    size_t chunk_size = 64 * 1024;        /* 64 KiB */
+    size_t total_size = 32 * 1024 * 1024; /* 32 MiB */
+    uint8_t* buffer = malloc(chunk_size);
+    VFS_ASSERT_TRUE(buffer != NULL);
+
+    struct timespec start, end;
+    VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+
+    size_t bytes_read_total = 0;
+    while (bytes_read_total < total_size) {
+        size_t read_bytes = 0;
+        vfs_status_t s = vfs_fread(vfs, fd, buffer, chunk_size, &read_bytes);
+        if (s != VFS_OK || read_bytes != chunk_size) {
+            free(buffer);
+            vfs_fclose(vfs, fd);
+            vfs_close(vfs);
+            return false;
+        }
+        bytes_read_total += read_bytes;
+    }
+
+    VFS_ASSERT_TRUE(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+
+    double seconds = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
+    double mib = (double)total_size / (1024.0 * 1024.0);
+    double throughput = mib / seconds;
+
+    printf("\n  Sequential Read Benchmark:\n");
+    printf("    Read Size    : %.2f MiB\n", mib);
+    printf("    Chunk Size   : %zu KiB\n", chunk_size / 1024);
+    printf("    Elapsed Time : %.4f seconds\n", seconds);
+    printf("    Throughput   : %.2f MiB/sec\n\n", throughput);
+
+    free(buffer);
+    vfs_close(vfs);
+    return true;
+}
+
 typedef struct {
     const char* name;
     bool (*func)(void);
@@ -522,13 +632,15 @@ int main(void) {
         {"System: List Traversals and Prefix Matches", test_directory_listing},
         {"System: Edge Cases and Invalid Arguments", test_edge_cases_and_limits},
         {"System: Maximum Open File descriptors", test_max_open_files_limit},
+        {"Benchmark: Sequential Write Speed", benchmark_write_throughput},
+        {"Benchmark: Sequential Read Speed", benchmark_read_throughput},
     };
 
     size_t test_count = sizeof(tests) / sizeof(tests[0]);
     size_t passed = 0;
 
-    printf("Executing Virtual File System (VFS) Tests...\n");
-    printf("===========================================\n");
+    printf("Executing Virtual File System (VFS) Tests and Benchmarks...\n");
+    printf("========================================================\n");
 
     for (size_t i = 0; i < test_count; i++) {
         printf("[%02zu/%02zu] RUNNING: %s...\n", i + 1, test_count, tests[i].name);
@@ -540,8 +652,8 @@ int main(void) {
         }
     }
 
-    printf("===========================================\n");
-    printf("Result Summary: %zu of %zu tests passed.\n", passed, test_count);
+    printf("========================================================\n");
+    printf("Result Summary: %zu of %zu tests/benchmarks passed.\n", passed, test_count);
 
     cleanup_image();
 

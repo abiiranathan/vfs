@@ -84,6 +84,17 @@ struct vfs_t {
     uint32_t* summary_bitmap;            /**< Purely in-memory summary bitmap.       */
     vfs_inode_t inodes[VFS_MAX_INODES];  /**< In-memory inode table.             */
     open_file_t oft[VFS_MAX_OPEN_FILES]; /**< Open-file table.                   */
+
+    /* Active Metadata Cache */
+    uint32_t cached_sib_blk;         /**< Physical block number of cached SIB. */
+    uint32_t cached_sib_table[1024]; /**< Cached SIB table content.            */
+    bool cached_sib_dirty;
+
+    uint32_t cached_dib_blk;         /**< Physical block number of cached DIB. */
+    uint32_t cached_dib_table[1024]; /**< Cached DIB table content.            */
+    bool cached_dib_dirty;
+
+    bool bitmap_dirty; /**< True when bitmap has unsaved edits.  */
 };
 
 /* =========================================================================
@@ -161,20 +172,6 @@ static vfs_status_t bitmap_write_locked(vfs_t* vfs) {
 }
 
 /**
- * Flushes a single 32-bit word of the block bitmap to the host file.
- * Used to avoid writing the entire bitmap region during common metadata ops.
- * Caller must hold vfs->lock.
- *
- * @param word_idx Index of the 32-bit word in the bitmap array.
- * @return VFS_OK or VFS_ERR_IO.
- */
-static vfs_status_t bitmap_write_word_locked(vfs_t* vfs, uint32_t word_idx) {
-    assert(word_idx < VFS_BITMAP_WORDS);
-    off_t off = VFS_BITMAP_OFFSET + (off_t)(word_idx * sizeof(uint32_t));
-    return pwrite_all(vfs->fd, &vfs->bitmap[word_idx], sizeof(uint32_t), off);
-}
-
-/**
  * Reads the block bitmap from the host file into memory.
  * Caller must hold vfs->lock.
  *
@@ -208,6 +205,135 @@ static vfs_status_t inode_write_locked(vfs_t* vfs, uint32_t idx) {
 }
 
 /* =========================================================================
+ * Metadata Cache Helpers
+ * ======================================================================= */
+/**
+ * Returns the host-file byte offset for physical block @p blk.
+ */
+static off_t block_offset(uint32_t blk) {
+    return VFS_DATA_OFFSET + (off_t)blk * (off_t)VFS_BLOCK_SIZE;
+}
+
+/**
+ * Writes the cached single indirect block to disk if it is dirty.
+ */
+static vfs_status_t flush_sib_cache_locked(vfs_t* vfs) {
+    if (vfs->cached_sib_dirty && vfs->cached_sib_blk != 0) {
+        vfs_status_t s = pwrite_all(vfs->fd, vfs->cached_sib_table, sizeof(vfs->cached_sib_table),
+                                    block_offset(vfs->cached_sib_blk));
+        if (s != VFS_OK) { return s; }
+        vfs->cached_sib_dirty = false;
+    }
+    return VFS_OK;
+}
+
+/**
+ * Writes the cached double indirect block to disk if it is dirty.
+ */
+static vfs_status_t flush_dib_cache_locked(vfs_t* vfs) {
+    if (vfs->cached_dib_dirty && vfs->cached_dib_blk != 0) {
+        vfs_status_t s = pwrite_all(vfs->fd, vfs->cached_dib_table, sizeof(vfs->cached_dib_table),
+                                    block_offset(vfs->cached_dib_blk));
+        if (s != VFS_OK) { return s; }
+        vfs->cached_dib_dirty = false;
+    }
+    return VFS_OK;
+}
+
+/**
+ * Writes all cached dirty metadata blocks back to disk.
+ */
+static vfs_status_t flush_metadata_cache_locked(vfs_t* vfs) {
+    vfs_status_t s = flush_sib_cache_locked(vfs);
+    if (s != VFS_OK) { return s; }
+    return flush_dib_cache_locked(vfs);
+}
+
+/**
+ * Reads a single indirect block through the metadata cache.
+ */
+static vfs_status_t cache_read_sib_locked(vfs_t* vfs, uint32_t sib_blk, uint32_t** out_table) {
+    if (vfs->cached_sib_blk == sib_blk) {
+        *out_table = vfs->cached_sib_table;
+        return VFS_OK;
+    }
+    vfs_status_t s = flush_sib_cache_locked(vfs);
+    if (s != VFS_OK) { return s; }
+
+    s = pread_all(vfs->fd, vfs->cached_sib_table, sizeof(vfs->cached_sib_table), block_offset(sib_blk));
+    if (s != VFS_OK) { return s; }
+    vfs->cached_sib_blk = sib_blk;
+    vfs->cached_sib_dirty = false;
+    *out_table = vfs->cached_sib_table;
+    return VFS_OK;
+}
+
+/**
+ * Reads a double indirect block through the metadata cache.
+ */
+static vfs_status_t cache_read_dib_locked(vfs_t* vfs, uint32_t dib_blk, uint32_t** out_table) {
+    if (vfs->cached_dib_blk == dib_blk) {
+        *out_table = vfs->cached_dib_table;
+        return VFS_OK;
+    }
+    vfs_status_t s = flush_dib_cache_locked(vfs);
+    if (s != VFS_OK) { return s; }
+
+    s = pread_all(vfs->fd, vfs->cached_dib_table, sizeof(vfs->cached_dib_table), block_offset(dib_blk));
+    if (s != VFS_OK) { return s; }
+    vfs->cached_dib_blk = dib_blk;
+    vfs->cached_dib_dirty = false;
+    *out_table = vfs->cached_dib_table;
+    return VFS_OK;
+}
+
+/**
+ * Initializes a new cached single indirect block in memory.
+ */
+static void cache_init_sib_locked(vfs_t* vfs, uint32_t sib_blk) {
+    (void)flush_sib_cache_locked(vfs);
+    vfs->cached_sib_blk = sib_blk;
+    memset(vfs->cached_sib_table, 0, sizeof(vfs->cached_sib_table));
+    vfs->cached_sib_dirty = true;
+}
+
+/**
+ * Initializes a new cached double indirect block in memory.
+ */
+static void cache_init_dib_locked(vfs_t* vfs, uint32_t dib_blk) {
+    (void)flush_dib_cache_locked(vfs);
+    vfs->cached_dib_blk = dib_blk;
+    memset(vfs->cached_dib_table, 0, sizeof(vfs->cached_dib_table));
+    vfs->cached_dib_dirty = true;
+}
+
+/**
+ * Invalidates cache entries matching a freed block.
+ */
+static void cache_invalidate_locked(vfs_t* vfs, uint32_t blk) {
+    if (vfs->cached_sib_blk == blk) {
+        vfs->cached_sib_blk = 0;
+        vfs->cached_sib_dirty = false;
+    }
+    if (vfs->cached_dib_blk == blk) {
+        vfs->cached_dib_blk = 0;
+        vfs->cached_dib_dirty = false;
+    }
+}
+
+/**
+ * Flushes block allocation bitmap modifications to disk if dirty.
+ */
+static vfs_status_t flush_bitmap_changes_locked(vfs_t* vfs) {
+    if (vfs->bitmap_dirty) {
+        vfs_status_t s = bitmap_write_locked(vfs);
+        if (s == VFS_OK) { vfs->bitmap_dirty = false; }
+        return s;
+    }
+    return VFS_OK;
+}
+
+/* =========================================================================
  * Free-block Bitmap helpers
  * ======================================================================= */
 
@@ -231,6 +357,7 @@ static void bitmap_set_used(vfs_t* vfs, uint32_t blk) {
     uint32_t word = blk / 32u;
     uint32_t bit = blk % 32u;
     vfs->bitmap[word] &= ~(UINT32_C(1) << bit);
+    vfs->bitmap_dirty = true;
 }
 
 /**
@@ -242,6 +369,7 @@ static void bitmap_set_free(vfs_t* vfs, uint32_t blk) {
     uint32_t word = blk / 32u;
     uint32_t bit = blk % 32u;
     vfs->bitmap[word] |= (UINT32_C(1) << bit);
+    vfs->bitmap_dirty = true;
 }
 
 /**
@@ -304,7 +432,7 @@ static vfs_status_t block_alloc_locked(vfs_t* vfs, uint32_t* out_blk) {
                 vfs->alloc_hint = w;
             }
 
-            return bitmap_write_word_locked(vfs, w);
+            return VFS_OK;
         }
         sbit_start = 0; /* Reset bit offset for subsequent summary words */
     }
@@ -335,7 +463,7 @@ static vfs_status_t block_free_locked(vfs_t* vfs, uint32_t blk) {
 
         if (word < vfs->alloc_hint) { vfs->alloc_hint = word; }
 
-        return bitmap_write_word_locked(vfs, word);
+        cache_invalidate_locked(vfs, blk);
     }
     return VFS_OK;
 }
@@ -343,13 +471,6 @@ static vfs_status_t block_free_locked(vfs_t* vfs, uint32_t blk) {
 /* =========================================================================
  * Physical addressing helpers
  * ======================================================================= */
-
-/**
- * Returns the host-file byte offset for physical block @p blk.
- */
-static off_t block_offset(uint32_t blk) {
-    return VFS_DATA_OFFSET + (off_t)blk * (off_t)VFS_BLOCK_SIZE;
-}
 
 /**
  * Zero-fills block @p blk on disk.
@@ -426,15 +547,16 @@ static vfs_status_t vfs_bmap_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t log
                 return s;
             }
             in->blocks[VFS_SINGLE_INDIRECT_INDEX] = sib_blk;
+            cache_init_sib_locked(vfs, sib_blk);
             sib_created = true;
         }
 
-        uint32_t table[1024];
+        uint32_t* table = NULL;
         if (!sib_created) {
-            vfs_status_t s = pread_all(vfs->fd, table, sizeof(table), block_offset(sib_blk));
+            vfs_status_t s = cache_read_sib_locked(vfs, sib_blk, &table);
             if (s != VFS_OK) { return s; }
         } else {
-            memset(table, 0, sizeof(table));
+            table = vfs->cached_sib_table;
         }
 
         uint32_t blk = table[sub_idx];
@@ -451,11 +573,7 @@ static vfs_status_t vfs_bmap_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t log
                 return s;
             }
             table[sub_idx] = blk;
-            s = pwrite_all(vfs->fd, table, sizeof(table), block_offset(sib_blk));
-            if (s != VFS_OK) {
-                (void)block_free_locked(vfs, blk);
-                return s;
-            }
+            vfs->cached_sib_dirty = true;
             in->block_count++;
         }
         *physical_block = blk;
@@ -483,15 +601,16 @@ static vfs_status_t vfs_bmap_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t log
             return s;
         }
         in->blocks[VFS_DOUBLE_INDIRECT_INDEX] = dib_blk;
+        cache_init_dib_locked(vfs, dib_blk);
         dib_created = true;
     }
 
-    uint32_t dib_table[1024];
+    uint32_t* dib_table = NULL;
     if (!dib_created) {
-        vfs_status_t s = pread_all(vfs->fd, dib_table, sizeof(dib_table), block_offset(dib_blk));
+        vfs_status_t s = cache_read_dib_locked(vfs, dib_blk, &dib_table);
         if (s != VFS_OK) { return s; }
     } else {
-        memset(dib_table, 0, sizeof(dib_table));
+        dib_table = vfs->cached_dib_table;
     }
 
     uint32_t sib_blk = dib_table[dib_idx];
@@ -510,20 +629,17 @@ static vfs_status_t vfs_bmap_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t log
             return s;
         }
         dib_table[dib_idx] = sib_blk;
-        s = pwrite_all(vfs->fd, dib_table, sizeof(dib_table), block_offset(dib_blk));
-        if (s != VFS_OK) {
-            (void)block_free_locked(vfs, sib_blk);
-            return s;
-        }
+        vfs->cached_dib_dirty = true;
+        cache_init_sib_locked(vfs, sib_blk);
         sib_created = true;
     }
 
-    uint32_t sib_table[1024];
+    uint32_t* sib_table = NULL;
     if (!sib_created) {
-        vfs_status_t s = pread_all(vfs->fd, sib_table, sizeof(sib_table), block_offset(sib_blk));
+        vfs_status_t s = cache_read_sib_locked(vfs, sib_blk, &sib_table);
         if (s != VFS_OK) { return s; }
     } else {
-        memset(sib_table, 0, sizeof(sib_table));
+        sib_table = vfs->cached_sib_table;
     }
 
     uint32_t blk = sib_table[sib_idx];
@@ -540,14 +656,49 @@ static vfs_status_t vfs_bmap_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t log
             return s;
         }
         sib_table[sib_idx] = blk;
-        s = pwrite_all(vfs->fd, sib_table, sizeof(sib_table), block_offset(sib_blk));
-        if (s != VFS_OK) {
-            (void)block_free_locked(vfs, blk);
-            return s;
-        }
+        vfs->cached_sib_dirty = true;
         in->block_count++;
     }
     *physical_block = blk;
+    return VFS_OK;
+}
+
+/**
+ * Resolves how many consecutive logical blocks starting at @p start_logical
+ * map to consecutive physical blocks on disk.
+ */
+static vfs_status_t vfs_bmap_run_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t start_logical, bool alloc,
+                                        uint32_t max_blocks, uint32_t* out_physical_start, uint32_t* out_run_length) {
+    if (max_blocks == 0) {
+        *out_physical_start = 0;
+        *out_run_length = 0;
+        return VFS_OK;
+    }
+
+    uint32_t first_phy = 0;
+    vfs_status_t s = vfs_bmap_locked(vfs, inode_idx, start_logical, alloc, &first_phy);
+    if (s != VFS_OK) { return s; }
+
+    *out_physical_start = first_phy;
+    uint32_t run = 1;
+
+    if (first_phy == 0) {
+        while (run < max_blocks) {
+            uint32_t next_phy = 0;
+            s = vfs_bmap_locked(vfs, inode_idx, start_logical + run, alloc, &next_phy);
+            if (s != VFS_OK || next_phy != 0) { break; }
+            run++;
+        }
+    } else {
+        while (run < max_blocks) {
+            uint32_t next_phy = 0;
+            s = vfs_bmap_locked(vfs, inode_idx, start_logical + run, alloc, &next_phy);
+            if (s != VFS_OK || next_phy != first_phy + run) { break; }
+            run++;
+        }
+    }
+
+    *out_run_length = run;
     return VFS_OK;
 }
 
@@ -562,6 +713,13 @@ static vfs_status_t vfs_bmap_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t log
  */
 static vfs_status_t inode_truncate_blocks_locked(vfs_t* vfs, uint32_t inode_idx, uint32_t new_block_count) {
     vfs_inode_t* in = &vfs->inodes[inode_idx];
+
+    /* Invalidate and flush the cache to prevent dirty cache writebacks of truncated blocks */
+    (void)flush_metadata_cache_locked(vfs);
+    vfs->cached_sib_blk = 0;
+    vfs->cached_sib_dirty = false;
+    vfs->cached_dib_blk = 0;
+    vfs->cached_dib_dirty = false;
 
     /* 1. Direct Block Range */
     for (uint32_t b = new_block_count; b < VFS_DIRECT_BLOCKS; b++) {
@@ -785,9 +943,17 @@ static vfs_t* vfs_alloc(void) {
 
     if (pthread_mutex_init(&v->lock, NULL) != 0) {
         free(v->bitmap);
+        free(v->summary_bitmap);
         free(v);
         return NULL;
     }
+
+    v->cached_sib_blk = 0;
+    v->cached_sib_dirty = false;
+    v->cached_dib_blk = 0;
+    v->cached_dib_dirty = false;
+    v->bitmap_dirty = false;
+
     oft_init(v);
     return v;
 }
@@ -806,6 +972,7 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
     if (vfs->fd < 0) {
         pthread_mutex_destroy(&vfs->lock);
         free(vfs->bitmap);
+        free(vfs->summary_bitmap);
         free(vfs);
         return VFS_ERR_IO;
     }
@@ -822,6 +989,7 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
     /* After setting vfs->bitmap with 0xFF... */
     memset(vfs->summary_bitmap, 0xFF, VFS_SUMMARY_WORDS * sizeof(uint32_t));
     bitmap_set_used(vfs, 0u);
+    vfs->bitmap_dirty = false;
 
     vfs->super = (vfs_super_t){
         .magic = VFS_MAGIC,
@@ -883,6 +1051,7 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
     if (vfs->fd < 0) {
         pthread_mutex_destroy(&vfs->lock);
         free(vfs->bitmap);
+        free(vfs->summary_bitmap);
         free(vfs);
         return VFS_ERR_IO;
     }
@@ -915,6 +1084,7 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
             pthread_mutex_destroy(&vfs->lock);
             close(vfs->fd);
             free(vfs->bitmap);
+            free(vfs->summary_bitmap);
             free(vfs);
             return VFS_ERR_CORRUPT;
         }
@@ -924,6 +1094,7 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
     {
         vfs_status_t s = bitmap_read_locked(vfs);
         if (s != VFS_OK) { goto io_error; }
+        vfs->bitmap_dirty = false;
     }
 
     /* Populate summary bitmap */
@@ -960,6 +1131,7 @@ io_error:
     pthread_mutex_destroy(&vfs->lock);
     close(vfs->fd);
     free(vfs->bitmap);
+    free(vfs->summary_bitmap);
     free(vfs);
     return VFS_ERR_IO;
 }
@@ -969,6 +1141,7 @@ void vfs_close(vfs_t* vfs) {
 
     if (!vfs->readonly && vfs->fd >= 0) {
         pthread_mutex_lock(&vfs->lock);
+        (void)flush_metadata_cache_locked(vfs);
         (void)super_write_locked(vfs);
         (void)bitmap_write_locked(vfs);
         (void)inodes_write_locked(vfs);
@@ -992,9 +1165,11 @@ vfs_status_t vfs_sync(vfs_t* vfs) {
 
     pthread_mutex_lock(&vfs->lock);
 
-    vfs_status_t s = super_write_locked(vfs);
+    vfs_status_t s = flush_metadata_cache_locked(vfs);
+    if (s == VFS_OK) { s = super_write_locked(vfs); }
     if (s == VFS_OK) { s = bitmap_write_locked(vfs); }
     if (s == VFS_OK) { s = inodes_write_locked(vfs); }
+    if (s == VFS_OK) { vfs->bitmap_dirty = false; }
 
     pthread_mutex_unlock(&vfs->lock);
     return s;
@@ -1103,6 +1278,9 @@ vfs_status_t vfs_fclose(vfs_t* vfs, vfs_fd_t fd) {
     of->pos = 0;
     of->flags = 0;
 
+    (void)flush_metadata_cache_locked(vfs);
+    (void)flush_bitmap_changes_locked(vfs);
+
     pthread_mutex_unlock(&vfs->lock);
     return VFS_OK;
 }
@@ -1143,31 +1321,36 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
     while (remaining > 0) {
         uint32_t block_idx = (uint32_t)((uint64_t)cur_pos / VFS_BLOCK_SIZE);
         uint32_t block_off = (uint32_t)((uint64_t)cur_pos % VFS_BLOCK_SIZE);
-        size_t can_read = VFS_BLOCK_SIZE - block_off;
-        if (can_read > remaining) { can_read = remaining; }
 
-        uint32_t blk = 0;
-        vfs_status_t s = vfs_bmap_locked(vfs, (uint32_t)of->inode_idx, block_idx, false, &blk);
+        uint32_t max_logical_blocks = (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
+
+        uint32_t physical_start = 0;
+        uint32_t run_blocks = 0;
+        vfs_status_t s = vfs_bmap_run_locked(vfs, (uint32_t)of->inode_idx, block_idx, false, max_logical_blocks,
+                                             &physical_start, &run_blocks);
         if (s != VFS_OK) {
             pthread_mutex_unlock(&vfs->lock);
             return s;
         }
 
-        if (blk == 0) {
+        size_t run_bytes = ((size_t)run_blocks * VFS_BLOCK_SIZE) - block_off;
+        if (run_bytes > remaining) { run_bytes = remaining; }
+
+        if (physical_start == 0) {
             /* Sparse hole: physical block was never allocated; return zeroes. */
-            memset(dst, 0, can_read);
+            memset(dst, 0, run_bytes);
         } else {
-            off_t off = block_offset(blk) + (off_t)block_off;
-            s = pread_all(vfs->fd, dst, can_read, off);
+            off_t off = block_offset(physical_start) + (off_t)block_off;
+            s = pread_all(vfs->fd, dst, run_bytes, off);
             if (s != VFS_OK) {
                 pthread_mutex_unlock(&vfs->lock);
                 return s;
             }
         }
 
-        dst += can_read;
-        cur_pos += (off_t)can_read;
-        remaining -= can_read;
+        dst += run_bytes;
+        cur_pos += (off_t)run_bytes;
+        remaining -= run_bytes;
     }
 
     of->pos = cur_pos;
@@ -1209,20 +1392,25 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
     while (remaining > 0) {
         uint32_t block_idx = (uint32_t)((uint64_t)cur_pos / VFS_BLOCK_SIZE);
         uint32_t block_off = (uint32_t)((uint64_t)cur_pos % VFS_BLOCK_SIZE);
-        size_t can_write = VFS_BLOCK_SIZE - block_off;
-        if (can_write > remaining) { can_write = remaining; }
 
-        uint32_t blk = 0;
-        rc = vfs_bmap_locked(vfs, (uint32_t)of->inode_idx, block_idx, true, &blk);
+        uint32_t max_logical_blocks = (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
+
+        uint32_t physical_start = 0;
+        uint32_t run_blocks = 0;
+        rc = vfs_bmap_run_locked(vfs, (uint32_t)of->inode_idx, block_idx, true, max_logical_blocks, &physical_start,
+                                 &run_blocks);
         if (rc != VFS_OK) { break; }
 
-        off_t off = block_offset(blk) + (off_t)block_off;
-        rc = pwrite_all(vfs->fd, src, can_write, off);
+        size_t run_bytes = ((size_t)run_blocks * VFS_BLOCK_SIZE) - block_off;
+        if (run_bytes > remaining) { run_bytes = remaining; }
+
+        off_t off = block_offset(physical_start) + (off_t)block_off;
+        rc = pwrite_all(vfs->fd, src, run_bytes, off);
         if (rc != VFS_OK) { break; }
 
-        src += can_write;
-        cur_pos += (off_t)can_write;
-        remaining -= can_write;
+        src += run_bytes;
+        cur_pos += (off_t)run_bytes;
+        remaining -= run_bytes;
     }
 
     size_t written = count - remaining;
@@ -1232,7 +1420,10 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
     in->modified_at = (uint64_t)time(NULL);
     of->pos = cur_pos;
 
-    vfs_status_t ws = inode_write_locked(vfs, (uint32_t)of->inode_idx);
+    /* Write modified metadata blocks, the target inode, and the updated bitmap to disk */
+    vfs_status_t ws = flush_metadata_cache_locked(vfs);
+    if (ws == VFS_OK) { ws = inode_write_locked(vfs, (uint32_t)of->inode_idx); }
+    if (ws == VFS_OK) { ws = flush_bitmap_changes_locked(vfs); }
     if (ws != VFS_OK && rc == VFS_OK) { rc = ws; }
 
     pthread_mutex_unlock(&vfs->lock);
@@ -1359,6 +1550,8 @@ vfs_status_t vfs_truncate(vfs_t* vfs, const char* path, uint64_t length) {
     rc = inode_write_locked(vfs, idx);
 
 out:
+    (void)flush_metadata_cache_locked(vfs);
+    (void)flush_bitmap_changes_locked(vfs);
     pthread_mutex_unlock(&vfs->lock);
     return rc;
 }
@@ -1409,6 +1602,7 @@ vfs_status_t vfs_unlink(vfs_t* vfs, const char* path) {
     }
 
     vfs_status_t rc = inode_free_locked(vfs, idx);
+    if (rc == VFS_OK) { rc = flush_bitmap_changes_locked(vfs); }
 
     pthread_mutex_unlock(&vfs->lock);
     return rc;
@@ -1506,6 +1700,7 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath) {
     rc = super_write_locked(vfs);
 
 out:
+    (void)flush_bitmap_changes_locked(vfs);
     pthread_mutex_unlock(&vfs->lock);
     return rc;
 }
