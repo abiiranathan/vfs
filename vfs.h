@@ -40,15 +40,19 @@
 #ifndef VFS_H
 #define VFS_H
 
-#include <assert.h>   /* static_assert */
-#include <inttypes.h> /* PRIu64, etc.                  */
-#include <stdbool.h>  /* bool                          */
-#include <stddef.h>   /* size_t                        */
-#include <stdint.h>   /* uint8_t, uint32_t, uint64_t   */
-#include <stdio.h>    /* FILE*                         */
+#include <assert.h>    /* static_assert */
+#include <errno.h>
+#include <inttypes.h>  /* PRIu64, etc.                  */
+#include <stdbool.h>   /* bool                          */
+#include <stddef.h>    /* size_t                        */
+#include <stdint.h>    /* uint8_t, uint32_t, uint64_t   */
+#include <stdio.h>     /* FILE*                         */
 #include <stdlib.h>
-#include <sys/types.h>/* off_t                         */
-#include <time.h>     /* time_t                        */
+#include <sys/mman.h>  /* memfd_create */
+#include <sys/types.h> /* off_t                         */
+#include <time.h>      /* time_t                        */
+#include <unistd.h>
+
 /* -------------------------------------------------------------------------
  * Compile-time tunables
  * ---------------------------------------------------------------------- */
@@ -518,6 +522,55 @@ static inline void* vfs_read_file(vfs_t* fs, const char* path, size_t* out_size)
     }
     *out_size = bytes_read;
     return data;
+}
+
+// =================== LOADING IMAGES FROM MEMORY =====================
+/**
+ * @brief Mounts a read-only or read-write VFS directly from a static memory array.
+ * 
+ * This helper instantiates an anonymous, RAM-backed file, writes the embedded
+ * filesystem payload into it, and mounts it using the standard VFS engine.
+ *
+ * @param embed_data Pointer to the embedded static byte array (e.g., asset_vfs_bytes).
+ * @param embed_size Total size of the embedded byte array.
+ * @param readonly   Mount the filesystem as read-only.
+ * @param out_vfs    Pointer populated with the resulting initialized vfs_t handle.
+ * @return VFS_OK, VFS_ERR_IO, or VFS_ERR_INVAL.
+ */
+static inline vfs_status_t vfs_open_embedded(const void* embed_data, size_t embed_size, bool readonly,
+                                             vfs_t** out_vfs) {
+    if (embed_data == NULL || embed_size == 0 || out_vfs == NULL) { return VFS_ERR_INVAL; }
+
+    /* 1. Create a purely RAM-backed, anonymous host file descriptor */
+    int mem_fd = memfd_create("vfs_embedded_image", MFD_CLOEXEC);
+    if (mem_fd < 0) { return VFS_ERR_IO; }
+
+    /* 2. Write the static binary array payload into the anonymous file */
+    const uint8_t* src = (const uint8_t*)embed_data;
+    size_t remaining = embed_size;
+    while (remaining > 0) {
+        ssize_t written = write(mem_fd, src, remaining);
+        if (written < 0) {
+            if (errno == EINTR) { continue; }
+            close(mem_fd);
+            return VFS_ERR_IO;
+        }
+        src += written;
+        remaining -= (size_t)written;
+    }
+
+    /* 3. Reference the open descriptor using procfs namespace */
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", mem_fd);
+
+    /* 4. Mount through existing path-based API */
+    vfs_status_t status = vfs_open(proc_path, readonly, out_vfs);
+
+    /* 5. Close local descriptor. The VFS internally duplicates or holds 
+          open the file reference, keeping the RAM file alive until vfs_close. */
+    close(mem_fd);
+
+    return status;
 }
 
 static_assert(sizeof(vfs_inode_t) == 1312, "vfs_inode_t size must be exactly 1312 bytes");

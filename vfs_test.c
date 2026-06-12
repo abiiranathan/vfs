@@ -613,6 +613,115 @@ static bool benchmark_read_throughput(void) {
     return true;
 }
 
+/* =============== EMBED ================== */
+#define TEMP_DISK_IMAGE "temp_build_image.vfs"
+#define TEST_FILE_PATH  "/assets/config.json"
+#define TEST_PAYLOAD    "{\"database\": \"embedded_ram_db\", \"status\": \"active\"}"
+
+bool test_open_from_memory(void) {
+    printf("Starting Embedded VFS Integration Test...\n");
+
+    vfs_t* disk_vfs = NULL;
+    vfs_status_t status;
+
+    /* =========================================================================
+     * Step 1: Create a physical VFS image on disk to generate the payload
+     * ======================================================================= */
+    printf("[1/4] Creating temporary VFS image on disk...\n");
+    status = vfs_create(TEMP_DISK_IMAGE, &disk_vfs);
+    VFS_ASSERT_STATUS_OK(status);
+
+    /* Open a new file in the disk-backed VFS */
+    vfs_fd_t fd = vfs_fopen(disk_vfs, TEST_FILE_PATH, VFS_O_CREAT | VFS_O_WRONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    /* Write the test data payload */
+    size_t payload_len = sizeof(TEST_PAYLOAD) - 1;
+    size_t written = 0;
+    status = vfs_fwrite(disk_vfs, fd, TEST_PAYLOAD, payload_len, &written);
+    assert(status == VFS_OK);
+    assert(written == payload_len);
+
+    /* Close file and close the VFS to flush everything to disk */
+    status = vfs_fclose(disk_vfs, fd);
+    assert(status == VFS_OK);
+    vfs_close(disk_vfs);
+    disk_vfs = NULL;
+
+    /* =========================================================================
+     * Step 2: Read the disk image into a memory buffer and delete the disk file
+     * ======================================================================= */
+    printf("[2/4] Reading disk image into memory buffer...\n");
+    FILE* f = fopen(TEMP_DISK_IMAGE, "rb");
+    if (!f) {
+        perror("Failed to open temporary image file");
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    void* memory_buffer = malloc((size_t)file_size);
+    assert(memory_buffer != NULL);
+
+    size_t read_bytes = fread(memory_buffer, 1, (size_t)file_size, f);
+    assert(read_bytes == (size_t)file_size);
+    fclose(f);
+
+    /* Delete the physical disk image to guarantee we cannot read from disk */
+    printf("      Deleting physical disk image: '%s'\n", TEMP_DISK_IMAGE);
+    int unlink_status = unlink(TEMP_DISK_IMAGE);
+    assert(unlink_status == 0);
+
+    /* =========================================================================
+     * Step 3: Mount the VFS directly from the memory buffer
+     * ======================================================================= */
+    printf("[3/4] Mounting in-memory VFS from buffer using helper...\n");
+    vfs_t* mem_vfs = NULL;
+    status = vfs_open_embedded(memory_buffer, (size_t)file_size, true, &mem_vfs);
+    if (status != VFS_OK) {
+        fprintf(stderr, "Failed to mount embedded VFS: %s\n", vfs_strerror(status));
+        free(memory_buffer);
+        return false;
+    }
+
+    /* We can safely free the local user buffer now, as memfd holds its own copy */
+    free(memory_buffer);
+    memory_buffer = NULL;
+
+    /* =========================================================================
+     * Step 4: Validate file contents from the memory-mounted VFS
+     * ======================================================================= */
+    printf("[4/4] Verifying file availability in memory-mounted VFS...\n");
+    assert(vfs_exists(mem_vfs, TEST_FILE_PATH) == true);
+
+    vfs_fd_t mem_fd = vfs_fopen(mem_vfs, TEST_FILE_PATH, VFS_O_RDONLY);
+    if (mem_fd < 0) {
+        fprintf(stderr, "Failed to open embedded file: %s\n", vfs_strerror((vfs_status_t)mem_fd));
+        vfs_close(mem_vfs);
+        return false;
+    }
+
+    char read_buffer[128];
+    memset(read_buffer, 0, sizeof(read_buffer));
+    size_t read_count = 0;
+    status = vfs_fread(mem_vfs, mem_fd, read_buffer, sizeof(read_buffer) - 1, &read_count);
+    assert(status == VFS_OK);
+    assert(read_count == payload_len);
+
+    printf("      Read payload from RAM: '%s'\n", read_buffer);
+    assert(strcmp(read_buffer, TEST_PAYLOAD) == 0);
+
+    /* Cleanup */
+    status = vfs_fclose(mem_vfs, mem_fd);
+    assert(status == VFS_OK);
+    vfs_close(mem_vfs);
+
+    printf("Embedded VFS Integration Test: PASS\n");
+    return true;
+}
+
 typedef struct {
     const char* name;
     bool (*func)(void);
@@ -621,6 +730,7 @@ typedef struct {
 int main(void) {
     test_t tests[] = {
         {"Lifecycle: Create, Open, Close", test_lifecycle_create_open_close},
+        {"Lifecycle: Open from memory", test_open_from_memory},
         {"Core IO: Basic File Read/Write/Seek", test_file_create_and_basic_write_read},
         {"Core IO: Multiple Block Crossings", test_read_write_large_file},
         {"Core IO: Append Enforcement Mode", test_append_mode},

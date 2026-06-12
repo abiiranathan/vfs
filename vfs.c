@@ -8,7 +8,6 @@
 #include "vfs.h"
 
 #include <assert.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -18,7 +17,6 @@
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -154,16 +152,6 @@ static vfs_status_t bitmap_write_locked(vfs_t* vfs) {
  */
 static vfs_status_t bitmap_read_locked(vfs_t* vfs) {
     return pread_all(vfs->fd, vfs->bitmap, VFS_BITMAP_WORDS * sizeof(uint32_t), VFS_BITMAP_OFFSET);
-}
-
-/**
- * Flushes all inodes to the host file.
- * Caller must hold vfs->lock.
- *
- * @return VFS_OK or VFS_ERR_IO.
- */
-static vfs_status_t inodes_write_locked(vfs_t* vfs) {
-    return pwrite_all(vfs->fd, vfs->inodes, sizeof(vfs->inodes), VFS_INODE_TABLE_OFFSET);
 }
 
 /**
