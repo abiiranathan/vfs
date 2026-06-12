@@ -4,6 +4,7 @@
  */
 
 #include "vfs.h"
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -505,6 +506,408 @@ static bool test_max_open_files_limit(void) {
 }
 
 /* =========================================================================
+ * vfs_sendfile tests
+ * ======================================================================= */
+
+/**
+ * Drains exactly @p n bytes from read-end of a pipe into @p dst.
+ *
+ * @return true on success, false if a short read or error occurs.
+ */
+static bool pipe_read_exact(int rfd, void* dst, size_t n) {
+    uint8_t* p = (uint8_t*)dst;
+    size_t rem = n;
+    while (rem > 0) {
+        ssize_t r = read(rfd, p, rem);
+        if (r <= 0) { return false; }
+        p += (size_t)r;
+        rem -= (size_t)r;
+    }
+    return true;
+}
+
+/**
+ * Verifies a full file transfer with offset == NULL (cursor-advancing mode).
+ *
+ * After the call of_pos must equal the file size, and every byte received
+ * on the pipe must match the original payload.
+ */
+static bool test_sendfile_full_transfer(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    /* Write a payload that spans exactly 3 blocks so the run-length path
+     * exercises at least one SIB lookup. */
+    const size_t payload_len = 3u * 4096u; /* 12 KiB */
+    uint8_t* payload = malloc(payload_len);
+    VFS_ASSERT_TRUE(payload != NULL);
+    for (size_t i = 0; i < payload_len; i++) {
+        payload[i] = (uint8_t)(i & 0xFF);
+    }
+
+    const char* path = "/sf_full.bin";
+    VFS_ASSERT_STATUS_OK(write_vfs_file(vfs, path, payload, payload_len));
+
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    int pipefd[2];
+    VFS_ASSERT_TRUE(pipe(pipefd) == 0);
+
+    size_t bytes_sent = 0;
+    VFS_ASSERT_STATUS_OK(vfs_sendfile(vfs, pipefd[1], fd,
+                                      /*offset=*/NULL, payload_len, &bytes_sent));
+    VFS_ASSERT_TRUE(bytes_sent == payload_len);
+
+    /* Cursor must have advanced to EOF. */
+    off_t pos = 0;
+    VFS_ASSERT_STATUS_OK(vfs_ftell(vfs, fd, &pos));
+    VFS_ASSERT_TRUE(pos == (off_t)payload_len);
+
+    /* Verify every byte received on the pipe. */
+    uint8_t* recv = malloc(payload_len);
+    VFS_ASSERT_TRUE(recv != NULL);
+    VFS_ASSERT_TRUE(pipe_read_exact(pipefd[0], recv, payload_len));
+    VFS_ASSERT_TRUE(memcmp(recv, payload, payload_len) == 0);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    free(payload);
+    free(recv);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+    vfs_close(vfs);
+    return true;
+}
+
+/**
+ * Verifies a partial transfer using an explicit @p offset.
+ *
+ * Linux sendfile(2) contract: the VFS file cursor must NOT move; the
+ * caller-supplied offset must be updated to reflect the next unread byte.
+ */
+static bool test_sendfile_offset_semantics(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    /* 64-byte payload; we will transfer a 24-byte window starting at byte 16. */
+    const char payload[64] = {0};
+    /* Fill with a visible pattern so partial copies are easy to diff. */
+    for (int i = 0; i < 64; i++) {
+        ((char*)payload)[i] = (char)('A' + (i % 26));
+    }
+
+    const char* path = "/sf_offset.bin";
+    VFS_ASSERT_STATUS_OK(write_vfs_file(vfs, path, payload, sizeof(payload)));
+
+    /* Open with cursor parked at byte 0. */
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    int pipefd[2];
+    VFS_ASSERT_TRUE(pipe(pipefd) == 0);
+
+    off_t off = 16;
+    size_t count = 24;
+    size_t bytes_sent = 0;
+    VFS_ASSERT_STATUS_OK(vfs_sendfile(vfs, pipefd[1], fd, &off, count, &bytes_sent));
+    VFS_ASSERT_TRUE(bytes_sent == count);
+
+    /* offset must now point one past the last transferred byte. */
+    VFS_ASSERT_TRUE(off == 16 + 24);
+
+    /* File cursor must be untouched (still 0). */
+    off_t cursor = -1;
+    VFS_ASSERT_STATUS_OK(vfs_ftell(vfs, fd, &cursor));
+    VFS_ASSERT_TRUE(cursor == 0);
+
+    /* Content check: bytes 16..39 of the payload. */
+    char recv[24];
+    VFS_ASSERT_TRUE(pipe_read_exact(pipefd[0], recv, sizeof(recv)));
+    VFS_ASSERT_TRUE(memcmp(recv, payload + 16, count) == 0);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+    vfs_close(vfs);
+    return true;
+}
+
+/**
+ * Verifies that sparse holes are materialised as zero bytes on the pipe.
+ *
+ * A file extended with vfs_truncate has no physical blocks; the sendfile
+ * implementation must emit actual zero bytes rather than skipping them,
+ * because a pipe reader has no concept of holes.
+ */
+static bool test_sendfile_sparse_hole(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    /* Extend to 8 KiB without writing any data — two fully sparse blocks. */
+    const char* path = "/sf_sparse.bin";
+    const size_t fsize = 2u * 4096u;
+    vfs_fd_t cfd = vfs_fopen(vfs, path, VFS_O_CREAT | VFS_O_WRONLY);
+    VFS_ASSERT_FD_OK(cfd);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, cfd));
+    VFS_ASSERT_STATUS_OK(vfs_truncate(vfs, path, fsize));
+
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    int pipefd[2];
+    VFS_ASSERT_TRUE(pipe(pipefd) == 0);
+
+    size_t bytes_sent = 0;
+    VFS_ASSERT_STATUS_OK(vfs_sendfile(vfs, pipefd[1], fd, NULL, fsize, &bytes_sent));
+    VFS_ASSERT_TRUE(bytes_sent == fsize);
+
+    uint8_t* recv = calloc(1, fsize);
+    VFS_ASSERT_TRUE(recv != NULL);
+    VFS_ASSERT_TRUE(pipe_read_exact(pipefd[0], recv, fsize));
+
+    /* Every byte must be zero. */
+    for (size_t i = 0; i < fsize; i++) {
+        if (recv[i] != 0) {
+            fprintf(stderr, "[FAIL] Non-zero byte at sparse offset %zu\n", i);
+            free(recv);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+            vfs_close(vfs);
+            return false;
+        }
+    }
+
+    free(recv);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+    vfs_close(vfs);
+    return true;
+}
+
+/**
+ * Verifies that a write-only VFS fd is rejected with VFS_ERR_INVAL.
+ */
+static bool test_sendfile_rejects_writeonly_fd(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    const char* path = "/sf_wo.bin";
+    VFS_ASSERT_STATUS_OK(write_vfs_file(vfs, path, "data", 4));
+
+    /* Open write-only — must not be usable as a sendfile source. */
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_WRONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    int pipefd[2];
+    VFS_ASSERT_TRUE(pipe(pipefd) == 0);
+
+    size_t bytes_sent = 1; /* pre-poison to ensure it is zeroed on error */
+    vfs_status_t s = vfs_sendfile(vfs, pipefd[1], fd, NULL, 4, &bytes_sent);
+    VFS_ASSERT_STATUS_EQ(s, VFS_ERR_INVAL);
+    VFS_ASSERT_TRUE(bytes_sent == 0);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+    vfs_close(vfs);
+    return true;
+}
+
+/**
+ * Verifies boundary and NULL-guard conditions.
+ */
+static bool test_sendfile_edge_cases(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    const char* path = "/sf_edge.bin";
+    VFS_ASSERT_STATUS_OK(write_vfs_file(vfs, path, "hello", 5));
+
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    int pipefd[2];
+    VFS_ASSERT_TRUE(pipe(pipefd) == 0);
+    size_t bytes_sent = 0;
+
+    /* NULL vfs. */
+    VFS_ASSERT_STATUS_EQ(vfs_sendfile(NULL, pipefd[1], fd, NULL, 5, &bytes_sent), VFS_ERR_INVAL);
+
+    /* Invalid host fd. */
+    VFS_ASSERT_STATUS_EQ(vfs_sendfile(vfs, -1, fd, NULL, 5, &bytes_sent), VFS_ERR_INVAL);
+
+    /* NULL bytes_sent. */
+    VFS_ASSERT_STATUS_EQ(vfs_sendfile(vfs, pipefd[1], fd, NULL, 5, NULL), VFS_ERR_INVAL);
+
+    /* Bad VFS fd. */
+    VFS_ASSERT_STATUS_EQ(vfs_sendfile(vfs, pipefd[1], 99, NULL, 5, &bytes_sent), VFS_ERR_BADFD);
+
+    /* count == 0 is always a no-op: bytes_sent stays 0, returns VFS_OK. */
+    bytes_sent = 1; /* pre-poison */
+    VFS_ASSERT_STATUS_OK(vfs_sendfile(vfs, pipefd[1], fd, NULL, 0, &bytes_sent));
+    VFS_ASSERT_TRUE(bytes_sent == 0);
+
+    /* offset past EOF: VFS_OK, bytes_sent == 0. */
+    off_t past_eof = 9999;
+    bytes_sent = 1; /* pre-poison */
+    VFS_ASSERT_STATUS_OK(vfs_sendfile(vfs, pipefd[1], fd, &past_eof, 5, &bytes_sent));
+    VFS_ASSERT_TRUE(bytes_sent == 0);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+    vfs_close(vfs);
+    return true;
+}
+
+/**
+ * Verifies that a multi-block transfer survives a VFS reopen (i.e., block
+ * mappings are correctly persisted and recovered before sendfile runs).
+ */
+static bool test_sendfile_after_reopen(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    /* Write a payload that exercises both direct and single-indirect blocks:
+     * 300 blocks = 254 direct + 46 SIB entries. */
+    const size_t payload_len = 300u * 4096u;
+    uint8_t* payload = malloc(payload_len);
+    VFS_ASSERT_TRUE(payload != NULL);
+    for (size_t i = 0; i < payload_len; i++) {
+        payload[i] = (uint8_t)((i ^ (i >> 8)) & 0xFF);
+    }
+
+    const char* path = "/sf_reopen.bin";
+    VFS_ASSERT_STATUS_OK(write_vfs_file(vfs, path, payload, payload_len));
+    vfs_close(vfs);
+    vfs = NULL;
+
+    /* Reopen read-only to prove the block map survives persistence. */
+    VFS_ASSERT_STATUS_OK(vfs_open(TEST_IMAGE, /*readonly=*/true, &vfs));
+
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    int pipefd[2];
+    VFS_ASSERT_TRUE(pipe(pipefd) == 0);
+
+    /* Read back in pipe-buffer-sized chunks to avoid a write/read deadlock:
+ * vfs_sendfile blocks until `want` bytes are written to the pipe, but the
+ * pipe buffer is typically only 64 KiB, so `want` must not exceed that. */
+    size_t total_sent = 0;
+    uint8_t* recv = malloc(payload_len);
+    VFS_ASSERT_TRUE(recv != NULL);
+    uint8_t* rp = recv;
+    const size_t chunk = 64u * 1024u; /* <= typical pipe capacity */
+
+    while (total_sent < payload_len) {
+        size_t want = payload_len - total_sent;
+        if (want > chunk) { want = chunk; }
+
+        size_t bytes_sent = 0;
+        VFS_ASSERT_STATUS_OK(vfs_sendfile(vfs, pipefd[1], fd, NULL, want, &bytes_sent));
+        VFS_ASSERT_TRUE(bytes_sent == want);
+
+        VFS_ASSERT_TRUE(pipe_read_exact(pipefd[0], rp, want));
+        rp += want;
+        total_sent += want;
+    }
+
+    VFS_ASSERT_TRUE(memcmp(recv, payload, payload_len) == 0);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    free(payload);
+    free(recv);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+    vfs_close(vfs);
+    return true;
+}
+
+/**
+ * Verifies a full transfer from the VFS to a real host filesystem file
+ * (out_fd is a regular file, not a pipe).
+ *
+ * This exercises the Linux sendfile(2) path with a destination type that
+ * supports normal lseek/pread semantics, and confirms the bytes written to
+ * the host file exactly match the source payload.
+ */
+static bool test_sendfile_to_host_file(void) {
+    vfs_t* vfs = NULL;
+    cleanup_image();
+    VFS_ASSERT_STATUS_OK(vfs_create(TEST_IMAGE, &vfs));
+
+    /* Payload spans multiple blocks, including a sparse hole, so the host
+     * file must end up byte-identical including the zero-filled region. */
+    const size_t data_len = 5u * 4096u;
+    uint8_t* payload = malloc(data_len);
+    VFS_ASSERT_TRUE(payload != NULL);
+    for (size_t i = 0; i < data_len; i++) {
+        payload[i] = (uint8_t)((i * 31u) & 0xFF);
+    }
+
+    const char* path = "/sf_to_host.bin";
+    VFS_ASSERT_STATUS_OK(write_vfs_file(vfs, path, payload, data_len));
+
+    /* Extend by 2 sparse blocks (no physical allocation) past the payload. */
+    const size_t hole_len = 2u * 4096u;
+    const size_t total_len = data_len + hole_len;
+    VFS_ASSERT_STATUS_OK(vfs_truncate(vfs, path, total_len));
+
+    vfs_fd_t fd = vfs_fopen(vfs, path, VFS_O_RDONLY);
+    VFS_ASSERT_FD_OK(fd);
+
+    /* Destination is a real regular file on the host filesystem. */
+    const char* host_path = "sf_host_dest.bin";
+    int out_fd = open(host_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    VFS_ASSERT_TRUE(out_fd >= 0);
+
+    size_t bytes_sent = 0;
+    VFS_ASSERT_STATUS_OK(vfs_sendfile(vfs, out_fd, fd, /*offset=*/NULL, total_len, &bytes_sent));
+    VFS_ASSERT_TRUE(bytes_sent == total_len);
+
+    /* Cursor must have advanced to EOF. */
+    off_t pos = 0;
+    VFS_ASSERT_STATUS_OK(vfs_ftell(vfs, fd, &pos));
+    VFS_ASSERT_TRUE(pos == (off_t)total_len);
+
+    close(out_fd);
+
+    /* Reopen the host file and verify its contents byte-for-byte. */
+    out_fd = open(host_path, O_RDONLY);
+    VFS_ASSERT_TRUE(out_fd >= 0);
+
+    uint8_t* host_data = malloc(total_len);
+    VFS_ASSERT_TRUE(host_data != NULL);
+    ssize_t n = read(out_fd, host_data, total_len);
+    VFS_ASSERT_TRUE(n == (ssize_t)total_len);
+
+    /* First data_len bytes must match the payload exactly. */
+    VFS_ASSERT_TRUE(memcmp(host_data, payload, data_len) == 0);
+
+    /* The trailing sparse region must read back as zeros. */
+    for (size_t i = data_len; i < total_len; i++) {
+        VFS_ASSERT_TRUE(host_data[i] == 0);
+    }
+
+    close(out_fd);
+    unlink(host_path);
+    free(payload);
+    free(host_data);
+    VFS_ASSERT_STATUS_OK(vfs_fclose(vfs, fd));
+    vfs_close(vfs);
+    return true;
+}
+
+/* =========================================================================
  * Quantitative Benchmarks
  * ======================================================================= */
 
@@ -790,6 +1193,13 @@ int main(void) {
         {"System: List Traversals and Prefix Matches", test_directory_listing},
         {"System: Edge Cases and Invalid Arguments", test_edge_cases_and_limits},
         {"System: Maximum Open File descriptors", test_max_open_files_limit},
+        {"sendfile: Full transfer, cursor mode", test_sendfile_full_transfer},
+        {"sendfile: Partial range, offset semantics", test_sendfile_offset_semantics},
+        {"sendfile: Sparse hole materialises zeros", test_sendfile_sparse_hole},
+        {"sendfile: Rejects write-only source fd", test_sendfile_rejects_writeonly_fd},
+        {"sendfile: Edge cases and NULL guards", test_sendfile_edge_cases},
+        {"sendfile: Multi-block transfer after reopen", test_sendfile_after_reopen},
+        {"sendfile: Full transfer to host filesystem file", test_sendfile_to_host_file},
         {"Benchmark: Sequential Write Speed", benchmark_write_throughput},
         {"Benchmark: Sequential Read Speed", benchmark_read_throughput},
     };

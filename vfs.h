@@ -40,18 +40,21 @@
 #ifndef VFS_H
 #define VFS_H
 
-#include <assert.h>    /* static_assert */
+#include <assert.h>       /* static_assert */
 #include <errno.h>
-#include <inttypes.h>  /* PRIu64, etc.                  */
-#include <stdbool.h>   /* bool                          */
-#include <stddef.h>    /* size_t                        */
-#include <stdint.h>    /* uint8_t, uint32_t, uint64_t   */
-#include <stdio.h>     /* FILE*                         */
+#include <inttypes.h>     /* PRIu64, etc.                  */
+#include <stdbool.h>      /* bool                          */
+#include <stddef.h>       /* size_t                        */
+#include <stdint.h>       /* uint8_t, uint32_t, uint64_t   */
+#include <stdio.h>        /* FILE*                         */
 #include <stdlib.h>
-#include <sys/mman.h>  /* memfd_create */
-#include <sys/types.h> /* off_t                         */
-#include <time.h>      /* time_t                        */
-#include <unistd.h>
+#include <sys/mman.h>     /* memfd_create */
+#include <sys/types.h>    /* off_t                         */
+#include <time.h>         /* time_t                        */
+#include <unistd.h>       /* write(2) */
+#if defined(__linux__)
+#include <sys/sendfile.h> /* sendfile(2) */
+#endif
 
 /* -------------------------------------------------------------------------
  * Compile-time tunables
@@ -572,6 +575,39 @@ static inline vfs_status_t vfs_open_embedded(const void* embed_data, size_t embe
 
     return status;
 }
+
+/**
+ * Transfers @p count bytes from a VFS file to a host file descriptor,
+ * mirroring the Linux sendfile(2) interface.
+ *
+ * If @p offset is non-NULL it is used as the read position and is updated
+ * to reflect the next unread byte on return; the file's internal cursor is
+ * not modified (Linux sendfile semantics).  If @p offset is NULL the file's
+ * current cursor is used and advanced.
+ *
+ * On Linux the function transfers each contiguous physical run directly
+ * between the two host file descriptors using the kernel sendfile(2) syscall,
+ * avoiding any userspace bounce buffer.  On other POSIX platforms it falls
+ * back to pread(2) + write(2) with a stack-allocated buffer sized to one
+ * VFS block.
+ *
+ * Sparse holes in the VFS file are materialised as zero bytes on @p out_fd.
+ *
+ * @param vfs         Mounted VFS handle.
+ * @param out_fd      Destination host file descriptor (socket, pipe, file).
+ * @param in_fd       Source VFS file descriptor; must be open for reading.
+ * @param offset      If non-NULL: read position in bytes (updated on return).
+ *                    If NULL: use and advance the file's cursor.
+ * @param count       Maximum number of bytes to transfer.
+ * @param bytes_sent  Set to the number of bytes successfully written to
+ *                    @p out_fd.  Never NULL.
+ * @return VFS_OK on success, or a VFS_ERR_* code on failure.
+ *         A short transfer (bytes_sent < count) paired with VFS_OK means EOF
+ *         was reached before @p count bytes were consumed.
+ * @note Not safe to call concurrently on the same @p in_fd without external
+ *       synchronisation, but the VFS mutex ensures internal consistency.
+ */
+vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count, size_t* bytes_sent);
 
 static_assert(sizeof(vfs_inode_t) == 1312, "vfs_inode_t size must be exactly 1312 bytes");
 static_assert(offsetof(vfs_inode_t, size) == 256, "layout changed");
