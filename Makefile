@@ -19,10 +19,15 @@ MKDIR       ?= mkdir -p
 RM          ?= rm -f
 
 # User compilation and linking flags
-CFLAGS      ?= -Wall -Wextra -O3 -g -std=c11 -D_GNU_SOURCE
+CFLAGS      ?= -Wall -Wextra -O3 -g -std=c11 -D_GNU_SOURCE -march=native
 CPPFLAGS    ?=
 LDFLAGS     ?=
 LDLIBS      ?=
+
+COMPILER_SUPPORTS_AVX2 := $(shell $(CC) -mavx2 -E - < /dev/null >/dev/null 2>&1 && echo yes || echo no)
+ifeq ($(COMPILER_SUPPORTS_AVX2),yes)
+    CFLAGS += -mavx2
+endif
 
 # Strict overrides to guarantee thread compatibility
 override CFLAGS   += -pthread
