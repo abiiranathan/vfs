@@ -46,6 +46,7 @@
 #include <stddef.h>   /* size_t                        */
 #include <stdint.h>   /* uint8_t, uint32_t, uint64_t   */
 #include <stdio.h>    /* FILE*                         */
+#include <stdlib.h>
 #include <sys/types.h>/* off_t                         */
 #include <time.h>     /* time_t                        */
 /* -------------------------------------------------------------------------
@@ -486,6 +487,37 @@ static inline vfs_status_t append_vfs_file(vfs_t* vfs, const char* path, const v
 
     if (status != VFS_OK) { return status; }
     return (written == len) ? VFS_OK : VFS_ERR_IO;
+}
+
+/**
+ * @brief Read the entire content of file at path.
+ *
+ * @param vfs     Mounted VFS handle.
+ * @param path    Absolute virtual path of the file o read.
+ * @param out_size Total number of bytes read or file size are written here.
+ * @return VFS_OK on success, or a negative vfs_status_t error code.
+ */
+static inline void* vfs_read_file(vfs_t* fs, const char* path, size_t* out_size) {
+    vfs_fd_t fd = vfs_fopen(fs, path, VFS_O_RDONLY);
+    if (fd < 0) return NULL;
+
+    vfs_stat_t st;
+    if (vfs_stat(fs, path, &st) != VFS_OK) return NULL;
+    if (st.size == 0) {
+        *out_size = 0;
+        return malloc(1);
+    }
+
+    void* data = malloc(st.size);
+    if (!data) return NULL;
+
+    size_t bytes_read = 0;
+    if (vfs_fread(fs, fd, data, st.size, &bytes_read) != VFS_OK) {
+        free(data);
+        return NULL;
+    }
+    *out_size = bytes_read;
+    return data;
 }
 
 static_assert(sizeof(vfs_inode_t) == 1312, "vfs_inode_t size must be exactly 1312 bytes");
