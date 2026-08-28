@@ -43,7 +43,6 @@ override LDLIBS   += -lpthread
 LIB_NAME        := $(BUILD_LIB_DIR)/libvfs.a
 TEST_BIN        := $(BUILD_BIN_DIR)/vfs_test
 CLI_BIN         := $(BUILD_BIN_DIR)/vfs-cli
-PACK_BIN        := $(BUILD_BIN_DIR)/vfs-pack
 
 # Source mapping
 VFS_SRC         := vfs.c
@@ -52,31 +51,25 @@ TEST_SRC        := vfs_test.c
 TEST_OBJ        := $(BUILD_OBJ_DIR)/vfs_test.o
 CLI_SRC         := vfs_cli.c
 CLI_OBJ         := $(BUILD_OBJ_DIR)/vfs_cli.o
-PACK_SRC        := vfs-pack.c
-PACK_OBJ        := $(BUILD_OBJ_DIR)/vfs_pack.o
 
-# Optional solidc flags for vfs-pack
+# Optional solidc flags for vfs-cli
 PKG_CONFIG      ?= pkg-config
 SOLIDC_CFLAGS   := $(shell command -v $(PKG_CONFIG) >/dev/null 2>&1 && $(PKG_CONFIG) --exists solidc 2>/dev/null && $(PKG_CONFIG) --cflags solidc 2>/dev/null)
 SOLIDC_LIBS     := $(shell command -v $(PKG_CONFIG) >/dev/null 2>&1 && $(PKG_CONFIG) --exists solidc 2>/dev/null && $(PKG_CONFIG) --libs solidc 2>/dev/null)
 SOLIDC_AVAILABLE := $(if $(strip $(SOLIDC_LIBS)),yes,no)
 
 ifneq ($(SOLIDC_AVAILABLE),yes)
-$(info Warning: solidc was not found via pkg-config; vfs-pack will be skipped by default)
+$(info Warning: solidc was not found via pkg-config; vfs_cli will be skipped by default)
 endif
 
-PACK_EXTRA_CPPFLAGS := $(SOLIDC_CFLAGS)
-PACK_EXTRA_LDLIBS   := $(SOLIDC_LIBS)
-PACK_TARGETS        := $(if $(SOLIDC_AVAILABLE),$(PACK_BIN),)
+CLI_EXTRA_CPPFLAGS := $(SOLIDC_CFLAGS)
+CLI_EXTRA_LDLIBS   := $(SOLIDC_LIBS)
+CLI_TARGETS        := $(if $(SOLIDC_AVAILABLE),$(CLI_BIN),)
 
 .PHONY: all test clean install uninstall
 
-# -------------------------------------------------------------------------
-# Build Targets
-# -------------------------------------------------------------------------
-
 # Default target: compile static library and all binaries
-all: $(LIB_NAME) $(TEST_BIN) $(CLI_BIN) $(PACK_TARGETS)
+all: $(LIB_NAME) $(TEST_BIN) $(CLI_TARGETS)
 
 $(BUILD_OBJ_DIR):
 	$(MKDIR) $@
@@ -95,10 +88,8 @@ $(TEST_OBJ): $(TEST_SRC) vfs.h | $(BUILD_OBJ_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 $(CLI_OBJ): $(CLI_SRC) vfs.h | $(BUILD_OBJ_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(CLI_EXTRA_CPPFLAGS) -c $< -o $@
 
-$(PACK_OBJ): $(PACK_SRC) vfs.h | $(BUILD_OBJ_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(PACK_EXTRA_CPPFLAGS) -c $< -o $@
 
 # Package static archive
 $(LIB_NAME): $(VFS_OBJ) | $(BUILD_LIB_DIR)
@@ -110,10 +101,8 @@ $(TEST_BIN): $(TEST_OBJ) $(LIB_NAME) | $(BUILD_BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(CLI_BIN): $(CLI_OBJ) $(LIB_NAME) | $(BUILD_BIN_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) $(CLI_EXTRA_LDLIBS) -o $@
 
-$(PACK_BIN): $(PACK_OBJ) $(LIB_NAME) | $(BUILD_BIN_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) $(PACK_EXTRA_LDLIBS) -o $@
 
 # Run the test suite
 test: $(TEST_BIN)
@@ -124,7 +113,7 @@ test: $(TEST_BIN)
 # -------------------------------------------------------------------------
 
 clean:
-	$(RM) $(VFS_OBJ) $(TEST_OBJ) $(CLI_OBJ) $(PACK_OBJ) $(LIB_NAME) $(TEST_BIN) $(CLI_BIN) $(PACK_BIN)
+	$(RM) $(VFS_OBJ) $(TEST_OBJ) $(CLI_OBJ) $(LIB_NAME) $(TEST_BIN) $(CLI_BIN)
 	$(RM_DIR) $(BUILD_OBJ_DIR) $(BUILD_LIB_DIR)
 	$(RM) test_system.vfs
 
