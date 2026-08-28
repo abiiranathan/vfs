@@ -3,6 +3,7 @@ project(VFSExplorer LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Find Qt6 components
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
@@ -10,6 +11,9 @@ qt_standard_project_setup()
 
 # Thread mapping required by pthread in vfs.c
 find_package(Threads REQUIRED)
+
+# Include parent directory for vfs.h
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 add_executable(VFSExplorer
     main.cpp
@@ -20,5 +24,5 @@ add_executable(VFSExplorer
 target_link_libraries(VFSExplorer PRIVATE 
     Qt6::Widgets
     Threads::Threads
-    vfs
+    ${CMAKE_CURRENT_SOURCE_DIR}/../lib/libvfs.a
 )
