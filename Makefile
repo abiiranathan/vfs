@@ -55,7 +55,7 @@ CLI_OBJ         := $(BUILD_OBJ_DIR)/vfs_cli.o
 PACK_SRC        := vfs-pack.c
 PACK_OBJ        := $(BUILD_OBJ_DIR)/vfs_pack.o
 
-# Optional solidc flags for vfs-pack
+# Optional solidc flags for vfs-pack and vfs-cli
 PKG_CONFIG      ?= pkg-config
 SOLIDC_CFLAGS   := $(shell command -v $(PKG_CONFIG) >/dev/null 2>&1 && $(PKG_CONFIG) --exists solidc 2>/dev/null && $(PKG_CONFIG) --cflags solidc 2>/dev/null)
 SOLIDC_LIBS     := $(shell command -v $(PKG_CONFIG) >/dev/null 2>&1 && $(PKG_CONFIG) --exists solidc 2>/dev/null && $(PKG_CONFIG) --libs solidc 2>/dev/null)
@@ -68,6 +68,9 @@ endif
 PACK_EXTRA_CPPFLAGS := $(SOLIDC_CFLAGS)
 PACK_EXTRA_LDLIBS   := $(SOLIDC_LIBS)
 PACK_TARGETS        := $(if $(SOLIDC_AVAILABLE),$(PACK_BIN),)
+
+CLI_EXTRA_CPPFLAGS  := $(SOLIDC_CFLAGS)
+CLI_EXTRA_LDLIBS    := $(SOLIDC_LIBS)
 
 .PHONY: all test clean install uninstall
 
@@ -95,7 +98,7 @@ $(TEST_OBJ): $(TEST_SRC) vfs.h | $(BUILD_OBJ_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 $(CLI_OBJ): $(CLI_SRC) vfs.h | $(BUILD_OBJ_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(CLI_EXTRA_CPPFLAGS) -c $< -o $@
 
 $(PACK_OBJ): $(PACK_SRC) vfs.h | $(BUILD_OBJ_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(PACK_EXTRA_CPPFLAGS) -c $< -o $@
@@ -110,7 +113,7 @@ $(TEST_BIN): $(TEST_OBJ) $(LIB_NAME) | $(BUILD_BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(CLI_BIN): $(CLI_OBJ) $(LIB_NAME) | $(BUILD_BIN_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) $(CLI_EXTRA_LDLIBS) -o $@
 
 $(PACK_BIN): $(PACK_OBJ) $(LIB_NAME) | $(BUILD_BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) $(PACK_EXTRA_LDLIBS) -o $@
@@ -141,3 +144,4 @@ install: all
 uninstall:
 	$(RM) $(DESTDIR)$(LIBDIR)/libvfs.a
 	$(RM) $(DESTDIR)$(INCLUDEDIR)/vfs.h
+	
