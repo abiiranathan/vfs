@@ -9,3 +9,5 @@ vfs-cli
 bin
 obj
 lib
+.cache
+.vscode
