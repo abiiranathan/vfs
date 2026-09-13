@@ -1024,44 +1024,14 @@ static vfs_t* vfs_alloc(void) {
      * is all-zero bytes, so an explicitly zeroed pthread_rwlock_t is a
      * valid unlocked default (process-private) rwlock; skip 64K
      * init/destroy calls on mount/unmount. */
-#if defined(__GLIBC__)
     oft_init(v);
     return v;
-#else
-    if (pthread_rwlock_init(&v->meta_lock, NULL) != 0) {
-        free(v->used_inodes);
-        free(v->bitmap);
-        free(v);
-        return NULL;
-    }
-    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
-        if (pthread_rwlock_init(&v->inode_locks[i], NULL) != 0) {
-            for (uint32_t j = 0; j < i; j++) {
-                pthread_rwlock_destroy(&v->inode_locks[j]);
-            }
-            pthread_rwlock_destroy(&v->meta_lock);
-            free(v->used_inodes);
-            free(v->bitmap);
-            free(v);
-            return NULL;
-        }
-    }
-
-    oft_init(v);
-    return v;
-#endif
 }
 
 static void vfs_free_all(vfs_t* v) {
     if (v == NULL) {
         return;
     }
-#if !defined(__GLIBC__)
-    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
-        pthread_rwlock_destroy(&v->inode_locks[i]);
-    }
-    pthread_rwlock_destroy(&v->meta_lock);
-#endif
     free(v->bitmap);
     free(v->used_inodes);
     free(v->free_extents);
