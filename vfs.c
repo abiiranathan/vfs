@@ -92,6 +92,7 @@ struct vfs_t {
      * extent/size fields by inode_locks[i]. */
     vfs_inode_t* inodes;
     size_t inode_map_len;
+    bool inode_map_dirty; /**< True if any inode store has not been msync'd. */
 
     /* ---- Used-inode index (protected by meta_lock) ----
      * Compact array of slot indices currently in use, so path lookups
@@ -226,7 +227,7 @@ static inline vfs_status_t bitmap_read_locked(vfs_t* vfs) {
  */
 static inline vfs_status_t inode_write_locked(vfs_t* vfs, uint32_t idx) {
     assert(idx < VFS_MAX_INODES);
-    (void)vfs;
+    vfs->inode_map_dirty = true;
     return VFS_OK;
 }
 
@@ -1248,12 +1249,12 @@ void vfs_close(vfs_t* vfs) {
         (void)super_write_locked(vfs);
         (void)flush_bitmap_locked(vfs);
         (void)flush_all_dirty_inodes_locked(vfs);
-        pthread_rwlock_unlock(&vfs->meta_lock);
-        /* Persist the mmap'd inode table (inode_write_locked no longer
-         * issues per-inode pwrites). */
-        if (vfs->inodes != NULL) {
+        /* Persist the mmap'd inode table only if it was mutated. */
+        if (vfs->inodes != NULL && vfs->inode_map_dirty) {
             (void)msync((void*)vfs->inodes, vfs->inode_map_len, MS_SYNC);
+            vfs->inode_map_dirty = false;
         }
+        pthread_rwlock_unlock(&vfs->meta_lock);
     }
 
     inode_map_detach(vfs);
@@ -1285,10 +1286,13 @@ vfs_status_t vfs_sync(vfs_t* vfs) {
     if (s == VFS_OK) {
         s = flush_all_dirty_inodes_locked(vfs);
     }
-    /* Persist the mmap'd inode table. */
-    if (s == VFS_OK && vfs->inodes != NULL) {
+    /* Persist the mmap'd inode table only when it was actually mutated:
+     * msync walks every page of the 51.5 MB range. */
+    if (s == VFS_OK && vfs->inodes != NULL && vfs->inode_map_dirty) {
         if (msync((void*)vfs->inodes, vfs->inode_map_len, MS_SYNC) != 0) {
             s = VFS_ERR_IO;
+        } else {
+            vfs->inode_map_dirty = false;
         }
     }
     pthread_rwlock_unlock(&vfs->meta_lock);
