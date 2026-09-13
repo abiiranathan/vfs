@@ -1930,7 +1930,7 @@ vfs_status_t vfs_stat(vfs_t* vfs, const char* path, vfs_stat_t* st) {
         .created_at = (time_t)in->created_at,
         .modified_at = (time_t)in->modified_at,
     };
-    strncpy(st->path, in->path, VFS_MAX_PATH - 1u);
+    memcpy(st->path, in->path, VFS_MAX_PATH - 1u);
     st->path[VFS_MAX_PATH - 1u] = '\0';
     pthread_rwlock_unlock(&vfs->meta_lock);
     return VFS_OK;
@@ -2011,7 +2011,7 @@ void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* user
             .created_at = (time_t)in->created_at,
             .modified_at = (time_t)in->modified_at,
         };
-        strncpy(st.path, in->path, VFS_MAX_PATH - 1u);
+        memcpy(st.path, in->path, VFS_MAX_PATH - 1u);
         st.path[VFS_MAX_PATH - 1u] = '\0';
 
         pthread_rwlock_unlock(&vfs->meta_lock);
