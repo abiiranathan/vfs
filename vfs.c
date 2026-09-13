@@ -84,9 +84,23 @@ struct vfs_t {
     /* ---- Superblock (protected by meta_lock) ---- */
     vfs_super_t super;
 
-    /* ---- Inode table (protected by meta_lock for structural changes;
-     *      per-inode extent/size fields protected by inode_locks[i]) ---- */
-    vfs_inode_t inodes[VFS_MAX_INODES];
+    /* ---- Inode table ----
+     * mmap-backed view of the on-disk inode table (VFS_INODE_TABLE_OFFSET,
+     * VFS_MAX_INODES * VFS_INODE_ON_DISK_SIZE bytes). MAP_SHARED so the
+     * kernel writeback path is used directly; structural changes (alloc,
+     * rename, unlink) are still protected by meta_lock, per-inode
+     * extent/size fields by inode_locks[i]. */
+    vfs_inode_t* inodes;
+    size_t inode_map_len;
+
+    /* ---- Used-inode index (protected by meta_lock) ----
+     * Compact array of slot indices currently in use, so path lookups
+     * (inode_find) and listing cost O(used) instead of O(VFS_MAX_INODES)
+     * over the 51.5 MB mapped table. */
+    uint32_t* used_inodes;
+    uint32_t used_inode_count;
+    uint32_t next_free_inode_hint; /**< First possibly-free slot for alloc. */
+
     bool inode_dirty[VFS_MAX_INODES];
     uint32_t dirty_inode_count;
 
@@ -205,10 +219,15 @@ static inline vfs_status_t bitmap_read_locked(vfs_t* vfs) {
     return pread_all(vfs->fd, vfs->bitmap, VFS_BITMAP_WORDS * sizeof(uint32_t), VFS_BITMAP_OFFSET);
 }
 
+/**
+ * Persists inode @p idx. The inode table is mmap-backed: the caller has
+ * already mutated the shared mapping, so persistence reduces to the
+ * batched msync performed by vfs_sync()/vfs_close().
+ */
 static inline vfs_status_t inode_write_locked(vfs_t* vfs, uint32_t idx) {
     assert(idx < VFS_MAX_INODES);
-    off_t off = VFS_INODE_TABLE_OFFSET + (off_t)idx * (off_t)VFS_INODE_ON_DISK_SIZE;
-    return pwrite_all(vfs->fd, &vfs->inodes[idx], sizeof(vfs_inode_t), off);
+    (void)vfs;
+    return VFS_OK;
 }
 
 /** Marks inode @p idx dirty and force-flushes the batch if the threshold is hit. */
@@ -862,21 +881,62 @@ static void extents_resolve_read(const vfs_extent_t* extents, uint32_t count, ui
  * ======================================================================= */
 
 static uint32_t inode_find_locked(const vfs_t* vfs, const char* path) {
-    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
-        if (vfs->inodes[i].path[0] != '\0' && strncmp(vfs->inodes[i].path, path, VFS_MAX_PATH - 1u) == 0) {
+    for (uint32_t k = 0; k < vfs->used_inode_count; k++) {
+        uint32_t i = vfs->used_inodes[k];
+        if (strncmp(vfs->inodes[i].path, path, VFS_MAX_PATH - 1u) == 0) {
             return i;
         }
     }
     return INODE_NONE;
 }
 
-static uint32_t inode_alloc_slot_locked(const vfs_t* vfs) {
-    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
+static uint32_t inode_alloc_slot_locked(vfs_t* vfs) {
+    for (uint32_t i = vfs->next_free_inode_hint; i < VFS_MAX_INODES; i++) {
         if (vfs->inodes[i].path[0] == '\0') {
+            vfs->next_free_inode_hint = i + 1u;
+            /* Track the slot in the used index. */
+            if (vfs->used_inode_count < VFS_MAX_INODES) {
+                vfs->used_inodes[vfs->used_inode_count++] = i;
+            }
+            return i;
+        }
+    }
+    /* Hint exhausted: rescan from the beginning. */
+    for (uint32_t i = 0; i < vfs->next_free_inode_hint && i < VFS_MAX_INODES; i++) {
+        if (vfs->inodes[i].path[0] == '\0') {
+            vfs->next_free_inode_hint = i + 1u;
+            if (vfs->used_inode_count < VFS_MAX_INODES) {
+                vfs->used_inodes[vfs->used_inode_count++] = i;
+            }
             return i;
         }
     }
     return INODE_NONE;
+}
+
+/** Removes slot @p idx from the used-inode index (swap-remove). Caller holds meta_lock. */
+static void used_index_remove_locked(vfs_t* vfs, uint32_t idx) {
+    for (uint32_t k = 0; k < vfs->used_inode_count; k++) {
+        if (vfs->used_inodes[k] == idx) {
+            vfs->used_inodes[k] = vfs->used_inodes[vfs->used_inode_count - 1u];
+            vfs->used_inode_count--;
+            if (idx < vfs->next_free_inode_hint) {
+                vfs->next_free_inode_hint = idx;
+            }
+            return;
+        }
+    }
+}
+
+/** Builds the used-inode index from the mapped table. Caller holds meta_lock. */
+static void used_index_build_locked(vfs_t* vfs) {
+    vfs->used_inode_count = 0;
+    vfs->next_free_inode_hint = 0;
+    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
+        if (vfs->inodes[i].path[0] != '\0') {
+            vfs->used_inodes[vfs->used_inode_count++] = i;
+        }
+    }
 }
 
 /**
@@ -953,7 +1013,23 @@ static vfs_t* vfs_alloc(void) {
         return NULL;
     }
 
+    v->used_inodes = calloc(VFS_MAX_INODES, sizeof(uint32_t));
+    if (v->used_inodes == NULL) {
+        free(v->bitmap);
+        free(v);
+        return NULL;
+    }
+
+    /* calloc already zeroed the locks. glibc's PTHREAD_RWLOCK_INITIALIZER
+     * is all-zero bytes, so an explicitly zeroed pthread_rwlock_t is a
+     * valid unlocked default (process-private) rwlock; skip 64K
+     * init/destroy calls on mount/unmount. */
+#if defined(__GLIBC__)
+    oft_init(v);
+    return v;
+#else
     if (pthread_rwlock_init(&v->meta_lock, NULL) != 0) {
+        free(v->used_inodes);
         free(v->bitmap);
         free(v);
         return NULL;
@@ -964,6 +1040,7 @@ static vfs_t* vfs_alloc(void) {
                 pthread_rwlock_destroy(&v->inode_locks[j]);
             }
             pthread_rwlock_destroy(&v->meta_lock);
+            free(v->used_inodes);
             free(v->bitmap);
             free(v);
             return NULL;
@@ -972,19 +1049,51 @@ static vfs_t* vfs_alloc(void) {
 
     oft_init(v);
     return v;
+#endif
 }
 
 static void vfs_free_all(vfs_t* v) {
     if (v == NULL) {
         return;
     }
+#if !defined(__GLIBC__)
     for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
         pthread_rwlock_destroy(&v->inode_locks[i]);
     }
     pthread_rwlock_destroy(&v->meta_lock);
+#endif
     free(v->bitmap);
+    free(v->used_inodes);
     free(v->free_extents);
     free(v);
+}
+
+/** Byte length of the mmap'd inode-table region. */
+static inline size_t inode_map_size(void) { return (size_t)VFS_MAX_INODES * VFS_INODE_ON_DISK_SIZE; }
+
+/**
+ * Maps the on-disk inode table into memory. Replaces the previous
+ * 51.5 MB pread-into-calloc-buffer mount path with a zero-copy shared
+ * mapping: untouched (empty) inode pages are never faulted in, and
+ * inode updates become ordinary stores visible to writeback.
+ */
+static vfs_status_t inode_map_attach(vfs_t* vfs) {
+    int prot = vfs->readonly ? PROT_READ : (PROT_READ | PROT_WRITE);
+    void* p = mmap(NULL, inode_map_size(), prot, MAP_SHARED, vfs->fd, VFS_INODE_TABLE_OFFSET);
+    if (p == MAP_FAILED) {
+        return VFS_ERR_IO;
+    }
+    vfs->inodes = (vfs_inode_t*)p;
+    vfs->inode_map_len = inode_map_size();
+    return VFS_OK;
+}
+
+static void inode_map_detach(vfs_t* vfs) {
+    if (vfs->inodes != NULL && vfs->inode_map_len > 0) {
+        munmap((void*)vfs->inodes, vfs->inode_map_len);
+        vfs->inodes = NULL;
+        vfs->inode_map_len = 0;
+    }
 }
 
 /* =========================================================================
@@ -1007,6 +1116,14 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
         return VFS_ERR_IO;
     }
     vfs->readonly = false;
+
+    /* Pre-size the image to the full fixed layout so the inode table is
+     * an implicit zero extent on disk: no 51.5 MB memset/pwrite needed,
+     * and the mapping reads as zeros immediately. */
+    if (ftruncate(vfs->fd, VFS_DATA_OFFSET) != 0) {
+        vfs_close(vfs);
+        return VFS_ERR_IO;
+    }
 
     memset(vfs->bitmap, 0xFF, VFS_BITMAP_WORDS * sizeof(uint32_t));
     bitmap_set_used(vfs, 0u); /* Block 0 is the permanent "no block" sentinel. */
@@ -1056,7 +1173,9 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
         goto io_error;
     }
 
-    s = pwrite_all(vfs->fd, vfs->inodes, sizeof(vfs->inodes), VFS_INODE_TABLE_OFFSET);
+    /* Inode table is implicitly zeroed by the ftruncate above; attach the
+     * mapping instead of writing 51.5 MB of zeros. */
+    s = inode_map_attach(vfs);
     if (s != VFS_OK) {
         goto io_error;
     }
@@ -1128,14 +1247,19 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
         return VFS_ERR_NOMEM;
     }
 
-    s = pread_all(vfs->fd, vfs->inodes, sizeof(vfs->inodes), VFS_INODE_TABLE_OFFSET);
+    /* Inode table: mmap instead of a 51.5 MB pread. Untouched (empty)
+     * inode pages are never faulted in. */
+    s = inode_map_attach(vfs);
     if (s != VFS_OK) {
         goto io_error;
     }
 
+    pthread_rwlock_wrlock(&vfs->meta_lock);
+    used_index_build_locked(vfs);
+    pthread_rwlock_unlock(&vfs->meta_lock);
+
     *out_vfs = vfs;
     return VFS_OK;
-
 io_error:
     close(vfs->fd);
     vfs->fd = -1;
@@ -1155,7 +1279,14 @@ void vfs_close(vfs_t* vfs) {
         (void)flush_bitmap_locked(vfs);
         (void)flush_all_dirty_inodes_locked(vfs);
         pthread_rwlock_unlock(&vfs->meta_lock);
+        /* Persist the mmap'd inode table (inode_write_locked no longer
+         * issues per-inode pwrites). */
+        if (vfs->inodes != NULL) {
+            (void)msync((void*)vfs->inodes, vfs->inode_map_len, MS_SYNC);
+        }
     }
+
+    inode_map_detach(vfs);
 
     if (vfs->fd >= 0) {
         (void)close(vfs->fd);
@@ -1183,6 +1314,12 @@ vfs_status_t vfs_sync(vfs_t* vfs) {
     }
     if (s == VFS_OK) {
         s = flush_all_dirty_inodes_locked(vfs);
+    }
+    /* Persist the mmap'd inode table. */
+    if (s == VFS_OK && vfs->inodes != NULL) {
+        if (msync((void*)vfs->inodes, vfs->inode_map_len, MS_SYNC) != 0) {
+            s = VFS_ERR_IO;
+        }
     }
     pthread_rwlock_unlock(&vfs->meta_lock);
     return s;
@@ -1314,7 +1451,9 @@ vfs_status_t vfs_fclose(vfs_t* vfs, vfs_fd_t fd) {
 static vfs_status_t snapshot_extents_for_read(vfs_t* vfs, uint32_t inode_idx, vfs_extent_t* scratch,
                                               uint32_t scratch_cap, uint32_t* out_count, uint64_t* out_size) {
     pthread_rwlock_rdlock(&vfs->inode_locks[inode_idx]);
-    *out_size = vfs->inodes[inode_idx].size;
+    if (out_size != NULL) {
+        *out_size = vfs->inodes[inode_idx].size;
+    }
     vfs_status_t s = extents_load(vfs, inode_idx, scratch, scratch_cap, out_count);
     pthread_rwlock_unlock(&vfs->inode_locks[inode_idx]);
     return s;
@@ -1475,21 +1614,21 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
     size_t remaining = count;
     vfs_status_t rc = VFS_OK;
 
+    /* Snapshot the extent map once; reused across chunks. Only the
+     * hole-allocation path re-loads it (inside inode_apply_new_extent),
+     * so in-place overwrites skip all per-chunk extent reloads. */
+    vfs_extent_t scratch[VFS_MAX_INLINE_EXTENTS + VFS_EXTENTS_PER_OVERFLOW_BLOCK];
+    uint32_t extent_count = 0;
+    rc = snapshot_extents_for_read(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count, NULL);
+    if (rc != VFS_OK) {
+        *bytes_written = 0;
+        return rc;
+    }
+
     while (remaining > 0) {
         uint32_t block_idx = (uint32_t)((uint64_t)cur_pos / VFS_BLOCK_SIZE);
         uint32_t block_off = (uint32_t)((uint64_t)cur_pos % VFS_BLOCK_SIZE);
         bool full_block_overwrite = (block_off == 0) && (remaining >= VFS_BLOCK_SIZE);
-
-        /* Snapshot the current mapping for this logical block (read lock
-         * only, released before any I/O). */
-        vfs_extent_t scratch[VFS_MAX_INLINE_EXTENTS + VFS_EXTENTS_PER_OVERFLOW_BLOCK];
-        uint32_t extent_count = 0;
-        pthread_rwlock_rdlock(&vfs->inode_locks[inode_idx]);
-        rc = extents_load(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count);
-        pthread_rwlock_unlock(&vfs->inode_locks[inode_idx]);
-        if (rc != VFS_OK) {
-            break;
-        }
 
         uint32_t existing_phys = 0, existing_run = 0;
         uint32_t max_logical = (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
@@ -1557,6 +1696,14 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
                 block_free_run_locked(vfs, new_phys, alloc_len);
                 pthread_rwlock_unlock(&vfs->meta_lock);
                 break;
+            }
+            /* Mirror the new extent into the local snapshot so subsequent
+             * chunks resolve against the up-to-date map. */
+            uint32_t merged = extents_insert_local(scratch, extent_count,
+                                                   sizeof(scratch) / sizeof(scratch[0]), block_idx, new_phys,
+                                                   alloc_len);
+            if (merged != UINT32_MAX) {
+                extent_count = merged;
             }
             phys_start = new_phys;
         }
@@ -1817,6 +1964,7 @@ vfs_status_t vfs_unlink(vfs_t* vfs, const char* path) {
     pthread_rwlock_wrlock(&vfs->meta_lock);
     vfs_status_t rc = inode_free_all_blocks_locked(vfs, idx);
     if (rc == VFS_OK) {
+        used_index_remove_locked(vfs, idx);
         rc = flush_bitmap_locked(vfs);
     }
     pthread_rwlock_unlock(&vfs->meta_lock);
@@ -1847,7 +1995,8 @@ void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* user
     size_t prefix_len = match_all ? 0u : strlen(prefix);
 
     pthread_rwlock_rdlock(&vfs->meta_lock);
-    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
+    for (uint32_t k = 0; k < vfs->used_inode_count; k++) {
+        uint32_t i = vfs->used_inodes[k];
         const vfs_inode_t* in = &vfs->inodes[i];
         if (in->path[0] == '\0') {
             continue;
@@ -1917,6 +2066,7 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath) {
         if (rc != VFS_OK) {
             goto out;
         }
+        used_index_remove_locked(vfs, dst_idx);
     }
 
     vfs_inode_t* src = &vfs->inodes[src_idx];
