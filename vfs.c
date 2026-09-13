@@ -491,19 +491,47 @@ static bool free_extents_rebuild_locked(vfs_t* vfs) {
     uint32_t run_start = 0;
     bool in_run = false;
 
-    for (uint32_t blk = 0; blk < VFS_TOTAL_BLOCKS; blk++) {
-        bool free_bit = bitmap_is_free(vfs, blk);
-        if (free_bit && !in_run) {
-            run_start = blk;
-            in_run = true;
-        } else if (!free_bit && in_run) {
-            if (!free_extents_reserve(vfs, vfs->free_extent_count + 1u)) {
-                return false;
+    /* Word-wise scan: VFS_TOTAL_BLOCKS is an exact multiple of 32, so
+     * process one bitmap word (32 blocks) per iteration instead of one
+     * bit at a time. Fast-path fully-free/full words; a ~85% free image
+     * then costs a couple of compares per 32 blocks. */
+    for (uint32_t word = 0; word < VFS_BITMAP_WORDS; word++) {
+        uint32_t w = vfs->bitmap[word];
+        uint32_t blk = word * 32u;
+        if (w == 0) {
+            if (in_run) {
+                if (!free_extents_reserve(vfs, vfs->free_extent_count + 1u)) {
+                    return false;
+                }
+                vfs->free_extents[vfs->free_extent_count].start = run_start;
+                vfs->free_extents[vfs->free_extent_count].len = blk - run_start;
+                vfs->free_extent_count++;
+                in_run = false;
             }
-            vfs->free_extents[vfs->free_extent_count].start = run_start;
-            vfs->free_extents[vfs->free_extent_count].len = blk - run_start;
-            vfs->free_extent_count++;
-            in_run = false;
+            continue;
+        }
+        if (w == UINT32_MAX) {
+            if (!in_run) {
+                run_start = blk;
+                in_run = true;
+            }
+            continue;
+        }
+        for (uint32_t bit = 0; bit < 32u; bit++) {
+            uint32_t b = blk + bit;
+            bool free_bit = (w >> bit) & UINT32_C(1);
+            if (free_bit && !in_run) {
+                run_start = b;
+                in_run = true;
+            } else if (!free_bit && in_run) {
+                if (!free_extents_reserve(vfs, vfs->free_extent_count + 1u)) {
+                    return false;
+                }
+                vfs->free_extents[vfs->free_extent_count].start = run_start;
+                vfs->free_extents[vfs->free_extent_count].len = b - run_start;
+                vfs->free_extent_count++;
+                in_run = false;
+            }
         }
     }
 
