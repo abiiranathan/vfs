@@ -393,29 +393,23 @@ static vfs_status_t export_vfs_file(vfs_t* vfs, const char* vfs_path, const char
 
 /* =========================================================================
  * Flag value storage (bound at registration; valid for process lifetime)
+ *
+ * --container/-c is a single persistent (global) flag registered once on
+ * the root parser and inherited by every subcommand, accepted either
+ * before or after the subcommand name. Per-command handlers validate its
+ * presence themselves so commands that need no image (e.g. completion)
+ * keep working.
  * ======================================================================= */
 
-static char* f_create_c = NULL;
+static char* f_container = NULL;
 
-static char* f_pack_c = NULL;
 static char* f_pack_d = NULL;
 static bool f_pack_v = false;
 static int f_pack_j = 0; /**< Worker threads; 0 = auto (online CPU count). */
 
-static char* f_unpack_c = NULL;
 static char* f_unpack_d = NULL;
 static bool f_unpack_v = false;
 static int f_unpack_j = 0; /**< Worker threads; 0 = auto (online CPU count). */
-
-static char* f_ls_c = NULL;
-
-static char* f_add_c = NULL;
-static char* f_extract_c = NULL;
-static char* f_rm_c = NULL;
-static char* f_mv_c = NULL;
-static char* f_stat_c = NULL;
-static char* f_exists_c = NULL;
-static char* f_dump_c = NULL;
 
 /* =========================================================================
  * create
@@ -423,18 +417,18 @@ static char* f_dump_c = NULL;
 
 static void cmd_create(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_create_c || !f_create_c[0]) {
+    if (!f_container || !f_container[0]) {
         app_fail(ctx, "create requires -c/--container");
         return;
     }
     vfs_t* vfs = NULL;
-    vfs_status_t s = vfs_create(f_create_c, &vfs);
+    vfs_status_t s = vfs_create(f_container, &vfs);
     if (s != VFS_OK) {
-        app_fail(ctx, "vfs_create(%s): %s", f_create_c, vfs_strerror(s));
+        app_fail(ctx, "vfs_create(%s): %s", f_container, vfs_strerror(s));
         return;
     }
     vfs_close(vfs);
-    printf("created %s\n", f_create_c);
+    printf("created %s\n", f_container);
 }
 
 /* =========================================================================
@@ -551,15 +545,15 @@ static int cli_thread_count(int requested) {
 
 static void cmd_pack(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_pack_c || !f_pack_d) {
+    if (!f_container || !f_pack_d) {
         app_fail(ctx, "pack requires -c/--container and -d/--dir");
         return;
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = vfs_create(f_pack_c, &vfs);
+    vfs_status_t s = vfs_create(f_container, &vfs);
     if (s != VFS_OK) {
-        app_fail(ctx, "vfs_create(%s): %s", f_pack_c, vfs_strerror(s));
+        app_fail(ctx, "vfs_create(%s): %s", f_container, vfs_strerror(s));
         return;
     }
     defer { vfs_close(vfs); };
@@ -595,7 +589,7 @@ static void cmd_pack(void* ud) {
     size_t num_errors = atomic_load(&progress.num_errors);
     uint64_t total_bytes = atomic_load(&progress.total_bytes);
     fprintf(stderr, "packed %zu file(s), %llu byte(s) into %s", num_files,
-            (unsigned long long)total_bytes, f_pack_c);
+            (unsigned long long)total_bytes, f_container);
     if (num_errors) {
         fprintf(stderr, " (%zu error(s))\n", num_errors);
         ctx->exit_code = EXIT_FAILURE;
@@ -706,7 +700,7 @@ static void unpack_task_fn(void* job_array, size_t index, void* ctx_v) {
 
 static void cmd_unpack(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_unpack_c || !f_unpack_d) {
+    if (!f_container || !f_unpack_d) {
         app_fail(ctx, "unpack requires -c/--container and -d/--dir");
         return;
     }
@@ -716,9 +710,9 @@ static void cmd_unpack(void* ud) {
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_unpack_c, true, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, true, &vfs);
     if (s != VFS_OK) {
-        app_fail(ctx, "vfs_open(%s): %s", f_unpack_c, vfs_strerror(s));
+        app_fail(ctx, "vfs_open(%s): %s", f_container, vfs_strerror(s));
         return;
     }
     defer { vfs_close(vfs); };
@@ -771,7 +765,7 @@ static bool ls_cb(const char* path, const vfs_stat_t* st, void* userdata) {
 
 static void cmd_ls(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_ls_c) {
+    if (!f_container) {
         app_fail(ctx, "ls requires -c/--container");
         return;
     }
@@ -781,7 +775,7 @@ static void cmd_ls(void* ud) {
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_ls_c, true, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, true, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -799,7 +793,7 @@ static void cmd_ls(void* ud) {
 
 static void cmd_add(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_add_c) {
+    if (!f_container) {
         app_fail(ctx, "add requires -c/--container");
         return;
     }
@@ -815,7 +809,7 @@ static void cmd_add(void* ud) {
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_add_c, false, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, false, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -836,7 +830,7 @@ static void cmd_add(void* ud) {
 
 static void cmd_extract(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_extract_c) {
+    if (!f_container) {
         app_fail(ctx, "extract requires -c/--container");
         return;
     }
@@ -852,7 +846,7 @@ static void cmd_extract(void* ud) {
     const char* host_dst = pos_at(ctx, 1);
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_extract_c, true, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, true, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -873,7 +867,7 @@ static void cmd_extract(void* ud) {
 
 static void cmd_rm(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_rm_c) {
+    if (!f_container) {
         app_fail(ctx, "rm requires -c/--container");
         return;
     }
@@ -888,7 +882,7 @@ static void cmd_rm(void* ud) {
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_rm_c, false, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, false, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -904,7 +898,7 @@ static void cmd_rm(void* ud) {
 
 static void cmd_mv(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_mv_c) {
+    if (!f_container) {
         app_fail(ctx, "mv requires -c/--container");
         return;
     }
@@ -921,7 +915,7 @@ static void cmd_mv(void* ud) {
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_mv_c, false, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, false, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -937,7 +931,7 @@ static void cmd_mv(void* ud) {
 
 static void cmd_stat(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_stat_c) {
+    if (!f_container) {
         app_fail(ctx, "stat requires -c/--container");
         return;
     }
@@ -952,7 +946,7 @@ static void cmd_stat(void* ud) {
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_stat_c, true, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, true, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -977,7 +971,7 @@ static void cmd_stat(void* ud) {
 
 static void cmd_exists(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_exists_c) {
+    if (!f_container) {
         app_fail(ctx, "exists requires -c/--container");
         return;
     }
@@ -992,7 +986,7 @@ static void cmd_exists(void* ud) {
     }
 
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_exists_c, true, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, true, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -1009,12 +1003,12 @@ static void cmd_exists(void* ud) {
 
 static void cmd_dump(void* ud) {
     AppCtx* ctx = ud;
-    if (!f_dump_c) {
+    if (!f_container) {
         app_fail(ctx, "dump requires -c/--container");
         return;
     }
     vfs_t* vfs = NULL;
-    vfs_status_t s = safe_vfs_open(f_dump_c, true, &vfs);
+    vfs_status_t s = safe_vfs_open(f_container, true, &vfs);
     if (s != VFS_OK) {
         app_fail(ctx, "vfs_open: %s", vfs_strerror(s));
         return;
@@ -1046,18 +1040,18 @@ int main(int argc, char* argv[]) {
                            "  vfs mv      -c app.vfs /a /b\n"
                            "  vfs rm      -c app.vfs /b\n");
 
+    /* Global image flag, inherited by every subcommand (accepted before
+     * or after the subcommand name). Optional at parse time so commands
+     * like completion keep working; each handler validates it. */
+    flag_persistent_string(root, "container", 'c', "Path of the VFS image file", &f_container);
+
     /* --- create --- */
-    {
-        FlagParser* sub =
-            flag_add_subcommand(root, "create", "Create an empty VFS image", cmd_create);
-        flag_req_string(sub, "container", 'c', "Path of the new image file", &f_create_c);
-    }
+    flag_add_subcommand(root, "create", "Create an empty VFS image", cmd_create);
 
     /* --- pack --- */
     {
         FlagParser* sub = flag_add_subcommand(
             root, "pack", "Create image and pack a host directory into it", cmd_pack);
-        flag_req_string(sub, "container", 'c', "Output VFS image path", &f_pack_c);
         flag_req_string(sub, "dir", 'd', "Host directory to pack", &f_pack_d);
         flag_bool(sub, "verbose", 'v', "Print each packed file", &f_pack_v);
         flag_int(sub, "threads", 'j', "Worker threads (0 = all online CPUs, default 0)", &f_pack_j);
@@ -1067,7 +1061,6 @@ int main(int argc, char* argv[]) {
     {
         FlagParser* sub = flag_add_subcommand(
             root, "unpack", "Extract all files from an image to a host directory", cmd_unpack);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_unpack_c);
         flag_req_string(sub, "dir", 'd', "Host output directory", &f_unpack_d);
         flag_bool(sub, "verbose", 'v', "Print each extracted file", &f_unpack_v);
         flag_int(sub, "threads", 'j', "Worker threads (0 = all online CPUs, default 0)",
@@ -1075,59 +1068,29 @@ int main(int argc, char* argv[]) {
     }
 
     /* --- ls --- */
-    {
-        FlagParser* sub =
-            flag_add_subcommand(root, "ls", "List files (optional path prefix)", cmd_ls);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_ls_c);
-    }
+    flag_add_subcommand(root, "ls", "List files (optional path prefix)", cmd_ls);
 
     /* --- add --- */
-    {
-        FlagParser* sub =
-            flag_add_subcommand(root, "add", "Import one host file into the image", cmd_add);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_add_c);
-    }
+    flag_add_subcommand(root, "add", "Import one host file into the image", cmd_add);
 
     /* --- extract --- */
-    {
-        FlagParser* sub = flag_add_subcommand(
-            root, "extract", "Export one VFS file to the host (vfs_sendfile)", cmd_extract);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_extract_c);
-    }
+    flag_add_subcommand(root, "extract", "Export one VFS file to the host (vfs_sendfile)",
+                        cmd_extract);
 
     /* --- rm --- */
-    {
-        FlagParser* sub = flag_add_subcommand(root, "rm", "Remove a file from the image", cmd_rm);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_rm_c);
-    }
+    flag_add_subcommand(root, "rm", "Remove a file from the image", cmd_rm);
 
     /* --- mv --- */
-    {
-        FlagParser* sub =
-            flag_add_subcommand(root, "mv", "Rename/move a path inside the image", cmd_mv);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_mv_c);
-    }
+    flag_add_subcommand(root, "mv", "Rename/move a path inside the image", cmd_mv);
 
     /* --- stat --- */
-    {
-        FlagParser* sub =
-            flag_add_subcommand(root, "stat", "Show metadata for a VFS path", cmd_stat);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_stat_c);
-    }
+    flag_add_subcommand(root, "stat", "Show metadata for a VFS path", cmd_stat);
 
     /* --- exists --- */
-    {
-        FlagParser* sub = flag_add_subcommand(
-            root, "exists", "Test whether a VFS path exists (exit 0/1)", cmd_exists);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_exists_c);
-    }
+    flag_add_subcommand(root, "exists", "Test whether a VFS path exists (exit 0/1)", cmd_exists);
 
     /* --- dump --- */
-    {
-        FlagParser* sub = flag_add_subcommand(
-            root, "dump", "Print superblock and inode table diagnostics", cmd_dump);
-        flag_req_string(sub, "container", 'c', "VFS image path", &f_dump_c);
-    }
+    flag_add_subcommand(root, "dump", "Print superblock and inode table diagnostics", cmd_dump);
 
     flag_add_completion_cmd(root);
 
