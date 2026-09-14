@@ -36,6 +36,7 @@
 #include <string.h>       /* memset, memcpy, strncpy, strlen */
 #include <sys/mman.h>     /* memfd_create, MFD_CLOEXEC */
 #include <sys/sendfile.h> /* sendfile(2) */
+#include <sys/stat.h>     /* fstat, ftruncate, S_ISREG */
 #include <unistd.h>       /* pread, pwrite, close, write, unlink */
 
 /** Sentinel: no inode assigned. */
@@ -2605,6 +2606,142 @@ vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset,
     }
 
 done:
+    *bytes_sent = count - remaining;
+
+    pthread_rwlock_wrlock(&vfs->meta_lock);
+    of = oft_get_locked(vfs, in_fd);
+    if (of != NULL) {
+        if (offset != NULL) {
+            *offset = cur_pos;
+        } else {
+            of->pos = cur_pos;
+        }
+    }
+    pthread_rwlock_unlock(&vfs->meta_lock);
+
+    return rc;
+}
+
+/**
+ * Transfers @p count bytes from a VFS file to a host file descriptor
+ * using kernel-side copies (copy_file_range), mirroring the
+ * vfs_sendfile() interface and offset semantics.
+ *
+ * Each contiguous allocated run moves with a single copy_file_range()
+ * call; on reflink-capable filesystems the kernel may satisfy the copy
+ * as a metadata-only extent share, making even multi-GiB exports nearly
+ * free. Sparse holes are not moved at all: the destination is first
+ * sized (extend-only) to the transfer end with ftruncate(), so holes
+ * read back as zeros exactly as if explicit zero bytes had been written.
+ *
+ * Non-regular destinations (sockets, pipes) cannot be sized or cloned
+ * into, so those fall through to vfs_sendfile(), which handles them via
+ * sendfile/write. A kernel without copy offload falls back to
+ * pread/pwrite streaming inside copy_fd_range().
+ */
+vfs_status_t vfs_export_fd(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count,
+                           size_t* bytes_sent) {
+    if (vfs == NULL || out_fd < 0 || bytes_sent == NULL) {
+        return VFS_ERR_INVAL;
+    }
+    *bytes_sent = 0;
+    if (count == 0) {
+        return VFS_OK;
+    }
+
+    struct stat dst_st;
+    if (fstat(out_fd, &dst_st) < 0) {
+        return VFS_ERR_IO;
+    }
+    if (!S_ISREG(dst_st.st_mode)) {
+        return vfs_sendfile(vfs, out_fd, in_fd, offset, count, bytes_sent);
+    }
+
+    pthread_rwlock_rdlock(&vfs->meta_lock);
+    open_file_t* of = oft_get_locked(vfs, in_fd);
+    if (of == NULL) {
+        pthread_rwlock_unlock(&vfs->meta_lock);
+        return VFS_ERR_BADFD;
+    }
+    if ((of->flags & VFS_O_WRONLY) && !(of->flags & VFS_O_RDWR)) {
+        pthread_rwlock_unlock(&vfs->meta_lock);
+        return VFS_ERR_INVAL;
+    }
+    uint32_t inode_idx = (uint32_t)of->inode_idx;
+    off_t start_pos = (offset != NULL) ? *offset : of->pos;
+    pthread_rwlock_unlock(&vfs->meta_lock);
+
+    vfs_extent_t scratch[VFS_MAX_INLINE_EXTENTS + VFS_EXTENTS_PER_OVERFLOW_BLOCK];
+    uint32_t extent_count = 0;
+    uint64_t fsize = 0;
+    vfs_status_t rc = snapshot_extents_for_read(
+        vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count, &fsize);
+    if (rc != VFS_OK) {
+        return rc;
+    }
+
+    if (start_pos < 0 || (uint64_t)start_pos >= fsize) {
+        return VFS_OK; /* EOF; not an error. */
+    }
+    uint64_t avail = fsize - (uint64_t)start_pos;
+    if ((uint64_t)count > avail) {
+        count = (size_t)avail;
+    }
+
+    /* The fast path below places bytes at absolute destination offsets,
+     * which coincides with vfs_sendfile()'s sequential output only when
+     * both sides start at zero (fresh O_TRUNC destination, offset 0 --
+     * the bulk-export case). Anything else delegates for exact legacy
+     * semantics. */
+    off_t dst_cur = lseek(out_fd, 0, SEEK_CUR);
+    if (dst_cur != 0 || start_pos != 0) {
+        return vfs_sendfile(vfs, out_fd, in_fd, offset, count, bytes_sent);
+    }
+
+    /* Extend-only sizing so unmapped holes read back as zeros without
+     * moving any bytes for them. Never shrinks: bytes past the transfer
+     * keep whatever the caller left there. */
+    uint64_t want_size = (uint64_t)start_pos + (uint64_t)count;
+    if ((uint64_t)dst_st.st_size < want_size) {
+        if (ftruncate(out_fd, (off_t)want_size) != 0) {
+            return VFS_ERR_IO;
+        }
+    }
+
+    uint8_t* fallback_buf = NULL;
+    off_t cur_pos = start_pos;
+    size_t remaining = count;
+
+    while (remaining > 0) {
+        uint32_t block_idx = (uint32_t)((uint64_t)cur_pos / VFS_BLOCK_SIZE);
+        uint32_t block_off = (uint32_t)((uint64_t)cur_pos % VFS_BLOCK_SIZE);
+        uint32_t max_logical =
+            (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
+
+        uint32_t phys_start = 0, run_blocks = 0;
+        extents_resolve_read(scratch, extent_count, block_idx, max_logical, &phys_start,
+                             &run_blocks);
+
+        size_t run_bytes = (size_t)run_blocks * VFS_BLOCK_SIZE - block_off;
+        if (run_bytes > remaining) {
+            run_bytes = remaining;
+        }
+
+        if (phys_start != 0) {
+            off_t img_off = block_offset(phys_start) + (off_t)block_off;
+            rc = copy_fd_range(vfs->fd, &img_off, out_fd, cur_pos, run_bytes, &fallback_buf);
+            if (rc != VFS_OK) {
+                goto done;
+            }
+        }
+        /* Else a hole: destination bytes already read as zeros. */
+
+        cur_pos += (off_t)run_bytes;
+        remaining -= run_bytes;
+    }
+
+done:
+    free(fallback_buf);
     *bytes_sent = count - remaining;
 
     pthread_rwlock_wrlock(&vfs->meta_lock);

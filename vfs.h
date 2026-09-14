@@ -569,6 +569,39 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath);
 vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count,
                           size_t* bytes_sent);
 
+/**
+ * @brief Transfers @p count bytes from a VFS file to a host file descriptor.
+ *
+ * Same interface and offset semantics as vfs_sendfile(), but each
+ * contiguous allocated run moves with a single kernel-side
+ * copy_file_range() call instead of sendfile, so the kernel may satisfy
+ * the transfer as a metadata-only extent share (reflink) on supporting
+ * filesystems. Sparse holes are materialised as zero bytes by sizing the
+ * destination (extend-only) up front rather than by writing zeros.
+ *
+ * The zero-copy placement applies when the transfer starts at VFS offset
+ * 0 into a destination positioned at 0 (fresh bulk export), where
+ * absolute and sequential output coincide; any other combination --
+ * like non-regular destinations (sockets, pipes) -- falls through to
+ * vfs_sendfile() with byte-identical results. Kernels without copy
+ * offload fall back to pread/pwrite streaming internally.
+ *
+ * @param vfs         Mounted VFS handle.
+ * @param out_fd      Destination host file descriptor (regular file for
+ *                    the fast path; anything else uses vfs_sendfile).
+ * @param in_fd       Source VFS file descriptor; must be open for reading.
+ * @param offset      If non-NULL: read position in bytes (updated on return).
+ *                    If NULL: use and advance the file's cursor.
+ * @param count       Maximum number of bytes to transfer.
+ * @param bytes_sent  Set to the number of bytes placed in @p out_fd.
+ *                    Never NULL.
+ * @return VFS_OK on success, or a VFS_ERR_* code on failure.
+ *         A short transfer (bytes_sent < count) paired with VFS_OK means EOF
+ *         was reached before @p count bytes were consumed.
+ */
+vfs_status_t vfs_export_fd(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count,
+                           size_t* bytes_sent);
+
 /* -------------------------------------------------------------------------
  * Utility
  * ---------------------------------------------------------------------- */

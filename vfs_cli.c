@@ -370,7 +370,7 @@ static vfs_status_t export_vfs_file_sized(vfs_t* vfs, const char* vfs_path, cons
 
     size_t sent = 0;
     off_t off = 0;
-    vfs_status_t s = vfs_sendfile(vfs, hfd, vfd, &off, (size_t)size, &sent);
+    vfs_status_t s = vfs_export_fd(vfs, hfd, vfd, &off, (size_t)size, &sent);
     close(hfd);
     vfs_fclose(vfs, vfd);
 
