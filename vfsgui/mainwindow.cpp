@@ -12,67 +12,159 @@
 #include <QMessageBox>
 #include <QStyle>
 #include <algorithm>
+#include <atomic>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
 /* =========================================================================
- * Helper: Write a single host file into an active VFS handle
+ * Fast bulk transfer + parallel dispatch
+ *
+ * Mirrors the `vfs-cli pack` pipeline: whole files move through
+ * vfs_import_fd()/vfs_export_fd() (one kernel-side copy per extent,
+ * reflinked metadata-only where the filesystem supports it) instead of
+ * userspace 64 KiB read/write loops, and independent files are processed
+ * by a fixed worker pool. The library's per-inode locks make concurrent
+ * transfers on different files safe.
  * ======================================================================= */
-static bool writeHostFileToVfsHandle(vfs_t* vfs, const QString& hostPath, const QString& vfsPath) {
-    QFile file(hostPath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return false;
+
+/** Worker count: online CPUs, clamped to jobs and to 64. */
+static unsigned workerCount(size_t jobCount) {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) {
+        hw = 1;
     }
-
-    vfs_fd_t vfd = vfs_fopen(vfs, vfsPath.toUtf8().constData(), VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
-    if (vfd < 0) {
-        return false;
+    if (hw > 64) {
+        hw = 64;
     }
-
-    char buffer[65536];
-    qint64 bytesRead = 0;
-    bool ok = true;
-
-    while ((bytesRead = file.read(buffer, sizeof(buffer))) > 0) {
-        size_t written = 0;
-        vfs_status_t s = vfs_fwrite(vfs, vfd, buffer, static_cast<size_t>(bytesRead), &written);
-        if (s != VFS_OK || written != static_cast<size_t>(bytesRead)) {
-            ok = false;
-            break;
-        }
+    if (static_cast<size_t>(hw) > jobCount) {
+        hw = static_cast<unsigned>(jobCount);
     }
-
-    vfs_fclose(vfs, vfd);
-    return ok;
+    return hw;
 }
 
-/* =========================================================================
- * Helper: Export a single VFS file to host disk
- * ======================================================================= */
-static bool extractVfsFileToHostPath(vfs_t* vfs, const QString& vfsPath, const QString& hostPath) {
-    vfs_fd_t vfd = vfs_fopen(vfs, vfsPath.toUtf8().constData(), VFS_O_RDONLY);
-    if (vfd < 0) {
-        return false;
+/**
+ * Runs fn(i) for i in [0, jobCount) across a fixed pool driven by one
+ * atomic cursor, stopping early if @p canceled is set. The job list is
+ * fully known before dispatch, so a flat cursor has no contention and no
+ * idle worker ever spins.
+ */
+template <typename Fn>
+static void parallelFor(size_t jobCount, const std::atomic<bool>& canceled, Fn&& fn) {
+    if (jobCount == 0) {
+        return;
     }
-
-    QFile file(hostPath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        vfs_fclose(vfs, vfd);
-        return false;
-    }
-
-    char buffer[65536];
-    size_t readBytes = 0;
-    vfs_status_t s;
-    bool ok = true;
-
-    while ((s = vfs_fread(vfs, vfd, buffer, sizeof(buffer), &readBytes)) == VFS_OK && readBytes > 0) {
-        if (file.write(buffer, static_cast<qint64>(readBytes)) != static_cast<qint64>(readBytes)) {
-            ok = false;
-            break;
+    unsigned n = workerCount(jobCount);
+    if (n <= 1) {
+        for (size_t i = 0; i < jobCount && !canceled.load(); ++i) {
+            fn(i);
         }
+        return;
     }
 
+    std::atomic<size_t> cursor{0};
+    std::vector<std::thread> pool;
+    pool.reserve(n);
+    for (unsigned t = 0; t < n; ++t) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                if (canceled.load()) {
+                    return;
+                }
+                size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (i >= jobCount) {
+                    return;
+                }
+                fn(i);
+            }
+        });
+    }
+    for (auto& th : pool) {
+        th.join();
+    }
+}
+
+/**
+ * Imports one host file into the VFS through the kernel-side bulk path.
+ * Uses fstat() on the opened descriptor to avoid symlink/size races; the
+ * source is never mmap'd, so a concurrently shrinking file fails cleanly.
+ */
+static bool importHostFileRaw(vfs_t* vfs, const char* hostPath, const char* vfsPath) {
+    int hfd = ::open(hostPath, O_RDONLY | O_CLOEXEC);
+    if (hfd < 0) {
+        return false;
+    }
+
+    struct stat st;
+    if (::fstat(hfd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        ::close(hfd);
+        return false;
+    }
+
+    vfs_fd_t vfd = vfs_fopen(vfs, vfsPath, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    if (vfd < 0) {
+        ::close(hfd);
+        return false;
+    }
+
+    vfs_status_t s = VFS_OK;
+    if (st.st_size > 0) {
+        s = vfs_import_fd(vfs, vfd, hfd, static_cast<uint64_t>(st.st_size));
+    }
+
+    ::close(hfd);
     vfs_fclose(vfs, vfd);
-    return ok && (s == VFS_OK);
+    return s == VFS_OK;
+}
+
+/**
+ * Exports one VFS file to host disk through the kernel-side bulk path;
+ * sparse holes materialise as zeros for free, and a partial destination
+ * is unlinked on failure so no truncated file is left behind.
+ */
+static bool exportVfsFileRaw(vfs_t* vfs, const char* vfsPath, const char* hostPath) {
+    vfs_stat_t st;
+    if (vfs_stat(vfs, vfsPath, &st) != VFS_OK) {
+        return false;
+    }
+
+    int hfd = ::open(hostPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (hfd < 0) {
+        return false;
+    }
+
+    vfs_fd_t vfd = vfs_fopen(vfs, vfsPath, VFS_O_RDONLY);
+    if (vfd < 0) {
+        ::close(hfd);
+        return false;
+    }
+
+    size_t sent = 0;
+    off_t off = 0;
+    vfs_status_t s = VFS_OK;
+    if (st.size > 0) {
+        s = vfs_export_fd(vfs, hfd, vfd, &off, static_cast<size_t>(st.size), &sent);
+    }
+
+    ::close(hfd);
+    vfs_fclose(vfs, vfd);
+
+    if (s != VFS_OK || sent != static_cast<size_t>(st.size)) {
+        ::unlink(hostPath);
+        return false;
+    }
+    return true;
+}
+
+/** QString convenience wrappers for the single-file UI operations. */
+static bool writeHostFileToVfsHandle(vfs_t* vfs, const QString& hostPath, const QString& vfsPath) {
+    return importHostFileRaw(vfs, hostPath.toUtf8().constData(), vfsPath.toUtf8().constData());
+}
+
+static bool extractVfsFileToHostPath(vfs_t* vfs, const QString& vfsPath, const QString& hostPath) {
+    return exportVfsFileRaw(vfs, vfsPath.toUtf8().constData(), hostPath.toUtf8().constData());
 }
 
 /* =========================================================================
@@ -100,7 +192,22 @@ void PackWorker::process() {
         return;
     }
 
-    // 2. Initialize fresh container
+    // 2. Resolve every destination path up front so the parallel workers
+    //    share only the immutable job list.
+    struct PackJob {
+        QByteArray hostPath;
+        QByteArray vfsPath;
+        QString label;
+    };
+    std::vector<PackJob> jobs;
+    jobs.reserve(static_cast<size_t>(filesToPack.size()));
+    for (int i = 0; i < totalFiles; ++i) {
+        const QString& hostFilePath = filesToPack.at(i);
+        QString relPath = rootDir.relativeFilePath(hostFilePath);
+        jobs.push_back({hostFilePath.toUtf8(), ("/" + relPath).toUtf8(), relPath});
+    }
+
+    // 3. Initialize fresh container
     vfs_t* vfs = nullptr;
     vfs_status_t s = vfs_create(m_containerPath.toUtf8().constData(), &vfs);
     if (s != VFS_OK) {
@@ -108,35 +215,32 @@ void PackWorker::process() {
         return;
     }
 
-    // 3. Process each file with progress updates
-    size_t packedCount = 0;
-    size_t errorCount = 0;
+    // 4. Import files in parallel, one kernel-side bulk copy per extent.
+    std::atomic<size_t> packedCount{0};
+    std::atomic<size_t> errorCount{0};
+    std::atomic<size_t> completed{0};
 
-    for (int i = 0; i < totalFiles; ++i) {
-        if (m_canceled.load()) {
-            vfs_close(vfs);
-            QFile::remove(m_containerPath);
-            emit finished(false, packedCount, errorCount, "Operation canceled by user.");
-            return;
-        }
-
-        const QString& hostFilePath = filesToPack[i];
-        QString relPath = rootDir.relativeFilePath(hostFilePath);
-        QString vfsPath = "/" + relPath;
-
-        emit progress(i + 1, totalFiles, relPath);
-
-        if (!writeHostFileToVfsHandle(vfs, hostFilePath, vfsPath)) {
-            errorCount++;
+    parallelFor(jobs.size(), m_canceled, [&](size_t i) {
+        const PackJob& job = jobs[i];
+        if (importHostFileRaw(vfs, job.hostPath.constData(), job.vfsPath.constData())) {
+            packedCount.fetch_add(1, std::memory_order_relaxed);
         } else {
-            packedCount++;
+            errorCount.fetch_add(1, std::memory_order_relaxed);
         }
-    }
+        size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+        emit progress(static_cast<int>(done), totalFiles, job.label);
+    });
 
     vfs_sync(vfs);
     vfs_close(vfs);
 
-    emit finished(true, packedCount, errorCount, "");
+    if (m_canceled.load()) {
+        QFile::remove(m_containerPath);
+        emit finished(false, packedCount.load(), errorCount.load(), "Operation canceled by user.");
+        return;
+    }
+
+    emit finished(true, packedCount.load(), errorCount.load(), "");
 }
 
 /* =========================================================================
@@ -168,34 +272,48 @@ void UnpackWorker::process() {
     vfs_list(vfs, nullptr, scanCallback, &scanData);
 
     int totalFiles = static_cast<int>(scanData.paths.size());
-    size_t unpackedCount = 0;
-    size_t errorCount = 0;
 
+    // Resolve destinations and create parent directories up front (so the
+    // parallel workers only perform bulk transfers).
+    struct UnpackJob {
+        QByteArray vfsPath;
+        QByteArray hostPath;
+        QString label;
+    };
+    std::vector<UnpackJob> jobs;
+    jobs.reserve(static_cast<size_t>(scanData.paths.size()));
     for (int i = 0; i < totalFiles; ++i) {
-        if (m_canceled.load()) {
-            vfs_close(vfs);
-            emit finished(false, unpackedCount, errorCount, "Operation canceled by user.");
-            return;
-        }
-
-        const QString& vfsPath = scanData.paths[i];
+        const QString& vfsPath = scanData.paths.at(i);
         QString relPath = vfsPath.startsWith('/') ? vfsPath.mid(1) : vfsPath;
         QString hostPath = QDir(m_outDir).filePath(relPath);
-
-        emit progress(i + 1, totalFiles, relPath);
-
         QFileInfo fi(hostPath);
         QDir().mkpath(fi.absolutePath());
-
-        if (extractVfsFileToHostPath(vfs, vfsPath, hostPath)) {
-            unpackedCount++;
-        } else {
-            errorCount++;
-        }
+        jobs.push_back({vfsPath.toUtf8(), hostPath.toUtf8(), relPath});
     }
 
+    std::atomic<size_t> unpackedCount{0};
+    std::atomic<size_t> errorCount{0};
+    std::atomic<size_t> completed{0};
+
+    parallelFor(jobs.size(), m_canceled, [&](size_t i) {
+        const UnpackJob& job = jobs[i];
+        if (exportVfsFileRaw(vfs, job.vfsPath.constData(), job.hostPath.constData())) {
+            unpackedCount.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            errorCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+        emit progress(static_cast<int>(done), totalFiles, job.label);
+    });
+
     vfs_close(vfs);
-    emit finished(true, unpackedCount, errorCount, "");
+
+    if (m_canceled.load()) {
+        emit finished(false, unpackedCount.load(), errorCount.load(), "Operation canceled by user.");
+        return;
+    }
+
+    emit finished(true, unpackedCount.load(), errorCount.load(), "");
 }
 
 /* =========================================================================
