@@ -3,7 +3,7 @@
  * so this translation unit does not depend on the build system passing
  * -D_GNU_SOURCE on the command line. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
-    #define _GNU_SOURCE
+#define _GNU_SOURCE
 #endif
 
 /**
@@ -21,30 +21,35 @@
  *     with binary-search lookup; falls back to a chained overflow
  *     extent block for heavily fragmented files.
  *   - Dirty-flag batched metadata writeback: bitmap and inode entries
- *     are marked dirty and flushed on vfs_sync()/vfs_close(), or when
- *     the dirty-inode count crosses VFS_DIRTY_INODE_FLUSH_THRESHOLD.
+ *     are marked dirty and flushed on vfs_sync()/vfs_close().
  *   - Zero-fill is skipped whenever a newly allocated block is about to
  *     be fully overwritten by the caller's own write.
+  *   - Bulk imports go through vfs_import_fd(), which allocates storage
+ *     extent-by-extent and moves each whole extent kernel-side.
  */
 
 #include "vfs.h"
 
-#include <fcntl.h>  /* open, O_* */
-#include <limits.h> /* SSIZE_MAX */
-#include <stdlib.h> /* malloc, calloc, free, mkstemp */
-#include <string.h> /* memset, memcpy, strncpy, strlen */
-#include <unistd.h> /* pread, pwrite, close, write, unlink */
-
-#if defined(__linux__)
-    #include <sys/mman.h>     /* memfd_create, MFD_CLOEXEC */
-    #include <sys/sendfile.h> /* sendfile(2) */
-#endif
+#include <fcntl.h>        /* open, O_* */
+#include <limits.h>       /* SSIZE_MAX */
+#include <stdlib.h>       /* malloc, calloc, free, mkstemp */
+#include <string.h>       /* memset, memcpy, strncpy, strlen */
+#include <sys/mman.h>     /* memfd_create, MFD_CLOEXEC */
+#include <sys/sendfile.h> /* sendfile(2) */
+#include <unistd.h>       /* pread, pwrite, close, write, unlink */
 
 /** Sentinel: no inode assigned. */
 #define INODE_NONE UINT32_MAX
 
 /** Sentinel: slot is free in the open-file table. */
 #define OFT_FREE (-1)
+
+/**
+ * Path->inode-slot hash index capacity. Open-addressing table of
+ * (slot + 1) values, 0 = empty. Four slots per maximum inode keeps the
+ * load factor <= 0.25 so probe chains stay one or two cache lines.
+ */
+#define VFS_PATH_INDEX_CAP (VFS_MAX_INODES * 4u)
 
 /**
  * One entry in the runtime open-file table.
@@ -68,15 +73,17 @@ typedef struct {
  * metadata lock, mirroring the v2 SIB/DIB cache but for extents.
  */
 typedef struct {
-    uint32_t cached_block;                                       /**< Physical block currently cached, 0 = none. */
-    bool dirty;                                                  /**< True if cached_extents needs writeback.    */
-    vfs_extent_t cached_extents[VFS_EXTENTS_PER_OVERFLOW_BLOCK]; /**< Cached overflow extent array.          */
+    uint32_t cached_block; /**< Physical block currently cached, 0 = none. */
+    bool dirty;            /**< True if cached_extents needs writeback.    */
+    vfs_extent_t
+        cached_extents[VFS_EXTENTS_PER_OVERFLOW_BLOCK]; /**< Cached overflow extent array. */
 } overflow_cache_t;
 
 struct vfs_t {
     /* ---- Locks ---- */
-    pthread_rwlock_t meta_lock;                   /**< Guards bitmap, free list, inode table, superblock. */
-    pthread_rwlock_t inode_locks[VFS_MAX_INODES]; /**< Per-inode data-plane lock (extents + size + cursor). */
+    pthread_rwlock_t meta_lock; /**< Guards bitmap, free list, inode table, superblock. */
+    pthread_rwlock_t
+        inode_locks[VFS_MAX_INODES]; /**< Per-inode data-plane lock (extents + size + cursor). */
 
     /* ---- Host file ---- */
     int fd; /**< Host file descriptor for the image. */
@@ -84,29 +91,34 @@ struct vfs_t {
     /* ---- Superblock (protected by meta_lock) ---- */
     vfs_super_t super;
 
-    /* ---- Inode table ----
-     * mmap-backed view of the on-disk inode table (VFS_INODE_TABLE_OFFSET,
-     * VFS_MAX_INODES * VFS_INODE_ON_DISK_SIZE bytes). MAP_SHARED so the
-     * kernel writeback path is used directly; structural changes (alloc,
-     * rename, unlink) are still protected by meta_lock, per-inode
-     * extent/size fields by inode_locks[i]. */
+    /* ---- Inode table (protected by meta_lock for structural changes;
+     *      per-inode extent/size fields protected by inode_locks[i]) ----
+     * Heap-resident copy of the on-disk inode table. Persisted with
+     * explicit pread/pwrite -- never mmap'd, so a short/truncated image
+     * surfaces as VFS_ERR_IO/VFS_ERR_CORRUPT instead of SIGBUS, and an
+     * out-of-space fault surfaces as an error rather than a signal. */
     vfs_inode_t* inodes;
-    size_t inode_map_len;
-    bool inode_map_dirty; /**< True if any inode store has not been msync'd. */
+    bool* inode_dirty;
+    uint32_t dirty_inode_count;
 
     /* ---- Used-inode index (protected by meta_lock) ----
-     * Compact array of slot indices currently in use, so path lookups
-     * (inode_find) and listing cost O(used) instead of O(VFS_MAX_INODES)
-     * over the 51.5 MB mapped table. */
+     * Compact array of slot indices currently in use, so listing costs
+     * O(used) instead of O(VFS_MAX_INODES) over the 51.5 MB mapped table. */
     uint32_t* used_inodes;
     uint32_t used_inode_count;
     uint32_t next_free_inode_hint; /**< First possibly-free slot for alloc. */
 
-    bool inode_dirty[VFS_MAX_INODES];
-    uint32_t dirty_inode_count;
+    /* ---- Path hash index (protected by meta_lock) ----
+     * Open-addressing map from path string to inode slot, replacing the
+     * former O(used) strncmp scan in inode_find_locked. vfs_fopen/stat/
+     * unlink/rename become O(1) per file, so packing/unpacking N files
+     * costs O(N) total instead of O(N^2). Stores slot + 1; 0 = empty. */
+    uint32_t* path_index;
+    uint32_t path_index_count;
 
     /* ---- Open-file table (protected by meta_lock) ---- */
     open_file_t oft[VFS_MAX_OPEN_FILES];
+    uint32_t next_free_oft_hint; /**< First possibly-free OFT slot for alloc. */
 
     /* ---- Block bitmap (protected by meta_lock) ---- */
     uint32_t* bitmap; /**< Durable free-block bitmap, 1 = free. */
@@ -196,7 +208,9 @@ static vfs_status_t write_all(int fd, const void* buf, size_t n) {
 }
 
 /** Returns the host-file byte offset for physical block @p blk. */
-static inline off_t block_offset(uint32_t blk) { return VFS_DATA_OFFSET + (off_t)blk * (off_t)VFS_BLOCK_SIZE; }
+static inline off_t block_offset(uint32_t blk) {
+    return VFS_DATA_OFFSET + (off_t)blk * (off_t)VFS_BLOCK_SIZE;
+}
 
 /** Zero-fills physical block @p blk on disk. */
 static inline vfs_status_t block_zero(int fd, uint32_t blk) {
@@ -221,48 +235,41 @@ static inline vfs_status_t bitmap_read_locked(vfs_t* vfs) {
 }
 
 /**
- * Persists inode @p idx. The inode table is mmap-backed: the caller has
- * already mutated the shared mapping, so persistence reduces to the
- * batched msync performed by vfs_sync()/vfs_close().
+ * Persists inode @p idx with a single pwrite. Caller holds meta_lock.
+ * Errors (I/O, out of space) are returned, never raised as SIGBUS.
  */
 static inline vfs_status_t inode_write_locked(vfs_t* vfs, uint32_t idx) {
     assert(idx < VFS_MAX_INODES);
-    vfs->inode_map_dirty = true;
-    return VFS_OK;
+    off_t off = VFS_INODE_TABLE_OFFSET + (off_t)idx * (off_t)sizeof(vfs_inode_t);
+    vfs_status_t s = pwrite_all(vfs->fd, &vfs->inodes[idx], sizeof(vfs_inode_t), off);
+    if (s == VFS_OK && vfs->inode_dirty != NULL && vfs->inode_dirty[idx]) {
+        vfs->inode_dirty[idx] = false;
+        if (vfs->dirty_inode_count > 0) {
+            vfs->dirty_inode_count--;
+        }
+    }
+    return s;
 }
 
-/** Marks inode @p idx dirty and force-flushes the batch if the threshold is hit. */
+/**
+ * Marks inode @p idx dirty. The entry is written back by the next
+ * vfs_sync()/vfs_close() via flush_all_dirty_inodes_locked(); no scan
+ * is performed here so per-write cost stays O(1).
+ */
 static vfs_status_t inode_mark_dirty_locked(vfs_t* vfs, uint32_t idx) {
-    if (!vfs->inode_dirty[idx]) {
+    assert(idx < VFS_MAX_INODES);
+    if (vfs->inode_dirty != NULL && !vfs->inode_dirty[idx]) {
         vfs->inode_dirty[idx] = true;
         vfs->dirty_inode_count++;
     }
-    if (vfs->dirty_inode_count < VFS_DIRTY_INODE_FLUSH_THRESHOLD) {
-        return VFS_OK;
-    }
-
-    /* Batch threshold crossed: flush all dirty inodes now, still under
-     * meta_lock but this is metadata-only I/O, not on the data path. */
-    vfs_status_t s = VFS_OK;
-    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
-        if (vfs->inode_dirty[i]) {
-            vfs_status_t ws = inode_write_locked(vfs, i);
-            if (ws != VFS_OK) {
-                s = ws;
-                continue;
-            }
-            vfs->inode_dirty[i] = false;
-        }
-    }
-    vfs->dirty_inode_count = 0;
-    return s;
+    return VFS_OK;
 }
 
 static vfs_status_t overflow_cache_flush_locked(vfs_t* vfs) {
     if (vfs->overflow_cache.dirty && vfs->overflow_cache.cached_block != 0) {
-        vfs_status_t s =
-            pwrite_all(vfs->fd, vfs->overflow_cache.cached_extents, sizeof(vfs->overflow_cache.cached_extents),
-                       block_offset(vfs->overflow_cache.cached_block));
+        vfs_status_t s = pwrite_all(vfs->fd, vfs->overflow_cache.cached_extents,
+                                    sizeof(vfs->overflow_cache.cached_extents),
+                                    block_offset(vfs->overflow_cache.cached_block));
         if (s != VFS_OK) {
             return s;
         }
@@ -280,8 +287,8 @@ static vfs_status_t overflow_cache_read_locked(vfs_t* vfs, uint32_t blk, vfs_ext
     if (s != VFS_OK) {
         return s;
     }
-    s = pread_all(vfs->fd, vfs->overflow_cache.cached_extents, sizeof(vfs->overflow_cache.cached_extents),
-                  block_offset(blk));
+    s = pread_all(vfs->fd, vfs->overflow_cache.cached_extents,
+                  sizeof(vfs->overflow_cache.cached_extents), block_offset(blk));
     if (s != VFS_OK) {
         return s;
     }
@@ -303,20 +310,38 @@ static vfs_status_t flush_bitmap_locked(vfs_t* vfs) {
     return VFS_OK;
 }
 
-/** Flushes every dirty inode unconditionally. Caller holds meta_lock. */
+/**
+ * Flushes every dirty inode with explicit pwrite calls. Caller holds
+ * meta_lock. Only runs on vfs_sync()/vfs_close() (plus unlink/rename
+ * paths that already hold the lock), so the O(VFS_MAX_INODES) dirty-bit
+ * scan is paid once per sync -- not once per write -- and no SIGBUS can
+ * result from a short image file.
+ */
 static vfs_status_t flush_all_dirty_inodes_locked(vfs_t* vfs) {
+    if (vfs->dirty_inode_count == 0) {
+        return VFS_OK;
+    }
     vfs_status_t s = VFS_OK;
     for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
         if (vfs->inode_dirty[i]) {
             vfs_status_t ws = inode_write_locked(vfs, i);
-            if (ws != VFS_OK) {
+            if (ws != VFS_OK && s == VFS_OK) {
                 s = ws;
-                continue;
             }
-            vfs->inode_dirty[i] = false;
         }
     }
-    vfs->dirty_inode_count = 0;
+    if (s == VFS_OK) {
+        vfs->dirty_inode_count = 0;
+    } else {
+        /* Recompute: inode_write_locked clears bits it persisted. */
+        uint32_t left = 0;
+        for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
+            if (vfs->inode_dirty[i]) {
+                left++;
+            }
+        }
+        vfs->dirty_inode_count = left;
+    }
     return s;
 }
 
@@ -341,16 +366,53 @@ static inline void bitmap_set_free(vfs_t* vfs, uint32_t blk) {
     vfs->bitmap_dirty = true;
 }
 
+/* Word-wise range helpers: instead of flipping one bit at a time (a
+ * multi-GiB allocation previously looped millions of times under
+ * meta_lock), mask whole 32-block words in the interior and handle at
+ * most two partial words at the boundaries. */
+
 static inline void bitmap_mark_range_used(vfs_t* vfs, uint32_t start, uint32_t len) {
-    for (uint32_t i = 0; i < len; i++) {
-        bitmap_set_used(vfs, start + i);
+    if (len == 0) {
+        return;
     }
+    uint32_t end = start + len; /* Exclusive. */
+    uint32_t first_word = start / 32u;
+    uint32_t last_word = (end - 1u) / 32u;
+    uint32_t first_mask = UINT32_MAX << (start % 32u);
+    uint32_t last_mask = UINT32_MAX >> (31u - ((end - 1u) % 32u));
+
+    if (first_word == last_word) {
+        vfs->bitmap[first_word] &= ~(first_mask & last_mask);
+    } else {
+        vfs->bitmap[first_word] &= ~first_mask;
+        for (uint32_t w = first_word + 1u; w < last_word; w++) {
+            vfs->bitmap[w] = 0u;
+        }
+        vfs->bitmap[last_word] &= ~last_mask;
+    }
+    vfs->bitmap_dirty = true;
 }
 
 static inline void bitmap_mark_range_free(vfs_t* vfs, uint32_t start, uint32_t len) {
-    for (uint32_t i = 0; i < len; i++) {
-        bitmap_set_free(vfs, start + i);
+    if (len == 0) {
+        return;
     }
+    uint32_t end = start + len; /* Exclusive. */
+    uint32_t first_word = start / 32u;
+    uint32_t last_word = (end - 1u) / 32u;
+    uint32_t first_mask = UINT32_MAX << (start % 32u);
+    uint32_t last_mask = UINT32_MAX >> (31u - ((end - 1u) % 32u));
+
+    if (first_word == last_word) {
+        vfs->bitmap[first_word] |= (first_mask & last_mask);
+    } else {
+        vfs->bitmap[first_word] |= first_mask;
+        for (uint32_t w = first_word + 1u; w < last_word; w++) {
+            vfs->bitmap[w] = UINT32_MAX;
+        }
+        vfs->bitmap[last_word] |= last_mask;
+    }
+    vfs->bitmap_dirty = true;
 }
 
 /* =========================================================================
@@ -397,64 +459,86 @@ static inline uint32_t free_extents_lower_bound(const vfs_t* vfs, uint32_t key) 
     return lo;
 }
 
-/** Inserts (start,len) into the sorted free list, coalescing with neighbors. */
+/**
+ * Inserts (start, len) into the sorted free-extent list, coalescing with
+ * adjacent neighbors if contiguous.
+ *
+ * Caller must hold vfs->meta_lock.
+ *
+ * @param vfs    Mounted VFS handle.
+ * @param start  Starting physical block number.
+ * @param len    Number of contiguous blocks to free.
+ * @return true on success, false on memory allocation failure.
+ */
 static bool free_extents_insert(vfs_t* vfs, uint32_t start, uint32_t len) {
     if (len == 0) {
         return true;
     }
+
+    /* Find the first extent whose start >= 'start' */
     uint32_t pos = free_extents_lower_bound(vfs, start);
 
-    /* Try merging with the previous entry. */
     bool merged_left = false;
+    uint32_t target_idx = pos;
+
+    /* 1. Try merging with the predecessor (left) */
     if (pos > 0) {
         free_extent_t* prev = &vfs->free_extents[pos - 1u];
         if (prev->start + prev->len == start) {
             prev->len += len;
             merged_left = true;
-            pos -= 1u;
+            target_idx = pos - 1u;
         }
     }
-    /* Try merging with the next entry into the (possibly just-extended) left one. */
-    if (pos < vfs->free_extent_count) {
-        free_extent_t* cur = &vfs->free_extents[pos + (merged_left ? 0u : 0u)];
-        free_extent_t* target = merged_left ? &vfs->free_extents[pos] : NULL;
-        uint32_t seg_start = merged_left ? target->start : start;
-        uint32_t seg_len = merged_left ? target->len : len;
-        (void)cur;
+
+    if (merged_left) {
+        /* 2a. If we merged left, check if we now also touch the successor (right) */
         if (pos < vfs->free_extent_count) {
-            free_extent_t* right = &vfs->free_extents[merged_left ? pos + 1u : pos];
-            if (merged_left) {
-                if (pos + 1u < vfs->free_extent_count && seg_start + seg_len == right->start) {
-                    target->len += right->len;
-                    memmove(&vfs->free_extents[pos + 1u], &vfs->free_extents[pos + 2u],
-                            (size_t)(vfs->free_extent_count - pos - 2u) * sizeof(free_extent_t));
-                    vfs->free_extent_count--;
+            free_extent_t* target = &vfs->free_extents[target_idx];
+            free_extent_t* right = &vfs->free_extents[pos];
+
+            if (target->start + target->len == right->start) {
+                /* Bridge: absorb the right entry into target */
+                target->len += right->len;
+
+                /* Shift subsequent entries left by 1 to remove 'right' */
+                uint32_t remaining = vfs->free_extent_count - (pos + 1u);
+                if (remaining > 0) {
+                    memmove(&vfs->free_extents[pos], &vfs->free_extents[pos + 1u],
+                            (size_t)remaining * sizeof(free_extent_t));
                 }
-                return true;
-            } else {
-                if (seg_start + seg_len == right->start) {
-                    right->start = seg_start;
-                    right->len += seg_len;
-                    return true;
-                }
+                vfs->free_extent_count--;
             }
         }
-    }
-    if (merged_left) {
         return true;
     }
 
-    /* No adjacency: insert a fresh entry at `pos`. */
+    /* 2b. We did not merge left; try merging only with the successor (right) */
+    if (pos < vfs->free_extent_count) {
+        free_extent_t* right = &vfs->free_extents[pos];
+        if (start + len == right->start) {
+            right->start = start;
+            right->len += len;
+            return true;
+        }
+    }
+
+    /* 3. No adjacency: insert a fresh entry at 'pos' */
     if (!free_extents_reserve(vfs, vfs->free_extent_count + 1u)) {
         return false;
     }
 
-    memmove(&vfs->free_extents[pos + 1u], &vfs->free_extents[pos],
-            (size_t)(vfs->free_extent_count - pos) * sizeof(free_extent_t));
+    /* Shift entries right to make room at 'pos' */
+    uint32_t shift_count = vfs->free_extent_count - pos;
+    if (shift_count > 0) {
+        memmove(&vfs->free_extents[pos + 1u], &vfs->free_extents[pos],
+                (size_t)shift_count * sizeof(free_extent_t));
+    }
 
     vfs->free_extents[pos].start = start;
     vfs->free_extents[pos].len = len;
     vfs->free_extent_count++;
+
     return true;
 }
 
@@ -574,7 +658,8 @@ static bool free_extents_rebuild_locked(vfs_t* vfs) {
  *
  * @return VFS_OK with (*out_blk, *out_len), or VFS_ERR_NOSPACE.
  */
-static vfs_status_t block_alloc_run_locked(vfs_t* vfs, uint32_t preferred_len, uint32_t* out_blk, uint32_t* out_len) {
+static vfs_status_t block_alloc_run_locked(vfs_t* vfs, uint32_t preferred_len, uint32_t* out_blk,
+                                           uint32_t* out_len) {
     if (preferred_len == 0) {
         *out_blk = 0;
         *out_len = 0;
@@ -659,7 +744,8 @@ static void block_free_run_locked(vfs_t* vfs, uint32_t start, uint32_t len) {
     vfs->super.free_block_count += len;
     (void)free_extents_insert(vfs, start, len);
 
-    if (vfs->overflow_cache.cached_block >= start && vfs->overflow_cache.cached_block < start + len) {
+    if (vfs->overflow_cache.cached_block >= start &&
+        vfs->overflow_cache.cached_block < start + len) {
         vfs->overflow_cache.cached_block = 0;
         vfs->overflow_cache.dirty = false;
     }
@@ -679,8 +765,8 @@ static void block_free_run_locked(vfs_t* vfs, uint32_t start, uint32_t len) {
 /** Returns a pointer to all of an inode's extents by copying into @p out,
  * along with the total extent count. Reads the overflow block if present.
  * Takes meta_lock internally (short critical section, metadata-only). */
-static vfs_status_t extents_load(vfs_t* vfs, uint32_t inode_idx, vfs_extent_t* out, uint32_t out_cap,
-                                 uint32_t* out_count) {
+static vfs_status_t extents_load(vfs_t* vfs, uint32_t inode_idx, vfs_extent_t* out,
+                                 uint32_t out_cap, uint32_t* out_count) {
     vfs_inode_t* in = &vfs->inodes[inode_idx];
     uint32_t inline_n = in->inline_extent_count;
     uint32_t total = in->extent_count;
@@ -739,7 +825,8 @@ static uint32_t extents_find(const vfs_extent_t* extents, uint32_t count, uint32
  * need. Caller holds the inode's write lock; this function takes
  * meta_lock internally for the metadata-only writes.
  */
-static vfs_status_t extents_store(vfs_t* vfs, uint32_t inode_idx, const vfs_extent_t* extents, uint32_t count) {
+static vfs_status_t extents_store(vfs_t* vfs, uint32_t inode_idx, const vfs_extent_t* extents,
+                                  uint32_t count) {
     vfs_inode_t* in = &vfs->inodes[inode_idx];
 
     uint32_t inline_n = (count < VFS_MAX_INLINE_EXTENTS) ? count : VFS_MAX_INLINE_EXTENTS;
@@ -798,8 +885,8 @@ static vfs_status_t extents_store(vfs_t* vfs, uint32_t inode_idx, const vfs_exte
  * Overwrites any existing coverage of the same logical range (used only
  * for fresh allocations, which never overlap existing extents).
  */
-static uint32_t extents_insert_local(vfs_extent_t* extents, uint32_t count, uint32_t cap, uint32_t logical,
-                                     uint32_t physical, uint32_t length) {
+static uint32_t extents_insert_local(vfs_extent_t* extents, uint32_t count, uint32_t cap,
+                                     uint32_t logical, uint32_t physical, uint32_t length) {
     uint32_t pos = extents_find(extents, count, logical);
 
     /* Merge with previous extent if contiguous both logically and physically. */
@@ -814,7 +901,8 @@ static uint32_t extents_insert_local(vfs_extent_t* extents, uint32_t count, uint
                 if (prev->logical_block + prev->length == next->logical_block &&
                     prev->physical_block + prev->length == next->physical_block) {
                     prev->length += next->length;
-                    memmove(&extents[pos], &extents[pos + 1u], (size_t)(count - pos - 1u) * sizeof(vfs_extent_t));
+                    memmove(&extents[pos], &extents[pos + 1u],
+                            (size_t)(count - pos - 1u) * sizeof(vfs_extent_t));
                     return count - 1u;
                 }
             }
@@ -824,7 +912,8 @@ static uint32_t extents_insert_local(vfs_extent_t* extents, uint32_t count, uint
     /* Merge with next extent only. */
     if (pos < count) {
         vfs_extent_t* next = &extents[pos];
-        if (logical + length == next->logical_block && physical != 0 && physical + length == next->physical_block) {
+        if (logical + length == next->logical_block && physical != 0 &&
+            physical + length == next->physical_block) {
             next->logical_block = logical;
             next->physical_block = physical;
             next->length += length;
@@ -852,8 +941,9 @@ static uint32_t extents_insert_local(vfs_extent_t* extents, uint32_t count, uint
  * @param[out] run_length      Length of the contiguous run found
  *                              (allocated or hole), capped at max_blocks.
  */
-static void extents_resolve_read(const vfs_extent_t* extents, uint32_t count, uint32_t logical_block,
-                                 uint32_t max_blocks, uint32_t* physical_start, uint32_t* run_length) {
+static void extents_resolve_read(const vfs_extent_t* extents, uint32_t count,
+                                 uint32_t logical_block, uint32_t max_blocks,
+                                 uint32_t* physical_start, uint32_t* run_length) {
     uint32_t idx = extents_find(extents, count, logical_block);
 
     if (idx < count && extents[idx].logical_block <= logical_block &&
@@ -878,15 +968,85 @@ static void extents_resolve_read(const vfs_extent_t* extents, uint32_t count, ui
 }
 
 /* =========================================================================
+ * Path hash index (caller holds meta_lock)
+ *
+ * Open-addressing (linear probe) map from the inode's path string to its
+ * slot index, with backward-shift deletion so probe chains never need
+ * tombstones. Replaces the former O(used) strncmp scan in
+ * inode_find_locked: with 65,536 files that scan made pack/unpack
+ * O(N^2) (~2.1 billion string compares); it is now O(1) per lookup.
+ * ======================================================================= */
+
+/** FNV-1a over the path string. */
+static inline uint32_t path_hash(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s != '\0') {
+        h ^= (uint32_t)(uint8_t)*s++;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/** Inserts inode @p slot (whose path must already be set) into the index. */
+static void path_index_insert_locked(vfs_t* vfs, uint32_t slot) {
+    assert(vfs->path_index_count < VFS_PATH_INDEX_CAP);
+    uint32_t mask = VFS_PATH_INDEX_CAP - 1u;
+    uint32_t h = path_hash(vfs->inodes[slot].path) & mask;
+    while (vfs->path_index[h] != 0) {
+        h = (h + 1u) & mask;
+    }
+    vfs->path_index[h] = slot + 1u;
+    vfs->path_index_count++;
+}
+
+/** Removes @p path from the index; no-op if absent. */
+static void path_index_remove_locked(vfs_t* vfs, const char* path) {
+    uint32_t mask = VFS_PATH_INDEX_CAP - 1u;
+    uint32_t h = path_hash(path) & mask;
+    while (vfs->path_index[h] != 0) {
+        if (strcmp(vfs->inodes[vfs->path_index[h] - 1u].path, path) == 0) {
+            break;
+        }
+        h = (h + 1u) & mask;
+    }
+    if (vfs->path_index[h] == 0) {
+        return;
+    }
+
+    /* Backward-shift deletion: pull up any entry in the probe cluster
+     * whose home position is not reachable without passing the hole. */
+    uint32_t hole = h;
+    for (;;) {
+        h = (h + 1u) & mask;
+        if (vfs->path_index[h] == 0) {
+            break;
+        }
+        uint32_t home = path_hash(vfs->inodes[vfs->path_index[h] - 1u].path) & mask;
+        /* Move entry h into the hole unless h is "between" home and hole
+         * in the cyclic probe order (i.e. removal would orphan it). */
+        bool between = (hole <= h) ? (home > hole && home <= h) : (home > hole || home <= h);
+        if (!between) {
+            vfs->path_index[hole] = vfs->path_index[h];
+            hole = h;
+        }
+    }
+    vfs->path_index[hole] = 0;
+    vfs->path_index_count--;
+}
+
+/* =========================================================================
  * Inode helpers (caller holds meta_lock)
  * ======================================================================= */
 
 static uint32_t inode_find_locked(const vfs_t* vfs, const char* path) {
-    for (uint32_t k = 0; k < vfs->used_inode_count; k++) {
-        uint32_t i = vfs->used_inodes[k];
-        if (strncmp(vfs->inodes[i].path, path, VFS_MAX_PATH - 1u) == 0) {
-            return i;
+    uint32_t mask = VFS_PATH_INDEX_CAP - 1u;
+    uint32_t h = path_hash(path) & mask;
+    while (vfs->path_index[h] != 0) {
+        uint32_t slot = vfs->path_index[h] - 1u;
+        if (strcmp(vfs->inodes[slot].path, path) == 0) {
+            return slot;
         }
+        h = (h + 1u) & mask;
     }
     return INODE_NONE;
 }
@@ -929,13 +1089,17 @@ static void used_index_remove_locked(vfs_t* vfs, uint32_t idx) {
     }
 }
 
-/** Builds the used-inode index from the mapped table. Caller holds meta_lock. */
+/** Builds the used-inode index and path hash index from the mapped table. Caller holds meta_lock.
+ */
 static void used_index_build_locked(vfs_t* vfs) {
     vfs->used_inode_count = 0;
     vfs->next_free_inode_hint = 0;
+    memset(vfs->path_index, 0, VFS_PATH_INDEX_CAP * sizeof(uint32_t));
+    vfs->path_index_count = 0;
     for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
         if (vfs->inodes[i].path[0] != '\0') {
             vfs->used_inodes[vfs->used_inode_count++] = i;
+            path_index_insert_locked(vfs, i);
         }
     }
 }
@@ -970,7 +1134,6 @@ static vfs_status_t inode_free_all_blocks_locked(vfs_t* vfs, uint32_t idx) {
 
     vfs->super.free_inode_count++;
     memset(in, 0, sizeof(*in));
-    vfs->inode_dirty[idx] = false;
     return inode_write_locked(vfs, idx);
 }
 
@@ -1003,68 +1166,90 @@ static void oft_init(vfs_t* vfs) {
 
 static vfs_t* vfs_alloc(void) {
     vfs_t* v = calloc(1, sizeof(*v));
-    if (v == NULL) {
-        return NULL;
-    }
+    if (v == NULL) return NULL;
     v->fd = -1;
+
+    pthread_rwlock_init(&v->meta_lock, NULL);
+    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
+        pthread_rwlock_init(&v->inode_locks[i], NULL);
+    }
 
     v->bitmap = calloc(VFS_BITMAP_WORDS, sizeof(uint32_t));
     if (v->bitmap == NULL) {
+        pthread_rwlock_destroy(&v->meta_lock);
         free(v);
         return NULL;
     }
 
     v->used_inodes = calloc(VFS_MAX_INODES, sizeof(uint32_t));
     if (v->used_inodes == NULL) {
+        pthread_rwlock_destroy(&v->meta_lock);
         free(v->bitmap);
         free(v);
         return NULL;
     }
 
-    /* calloc already zeroed the locks. glibc's PTHREAD_RWLOCK_INITIALIZER
-     * is all-zero bytes, so an explicitly zeroed pthread_rwlock_t is a
-     * valid unlocked default (process-private) rwlock; skip 64K
-     * init/destroy calls on mount/unmount. */
+    v->path_index = calloc(VFS_PATH_INDEX_CAP, sizeof(uint32_t));
+    if (v->path_index == NULL) {
+        pthread_rwlock_destroy(&v->meta_lock);
+        free(v->used_inodes);
+        free(v->bitmap);
+        free(v);
+        return NULL;
+    }
+
+    /* Heap inode table: calloc-zeroed, so a fresh image starts with all
+     * slots free without any disk I/O. No mmap => no SIGBUS window. */
+    v->inodes = calloc(VFS_MAX_INODES, sizeof(vfs_inode_t));
+    if (v->inodes == NULL) {
+        pthread_rwlock_destroy(&v->meta_lock);
+        free(v->path_index);
+        free(v->used_inodes);
+        free(v->bitmap);
+        free(v);
+        return NULL;
+    }
+
+    v->inode_dirty = calloc(VFS_MAX_INODES, sizeof(bool));
+    if (v->inode_dirty == NULL) {
+        pthread_rwlock_destroy(&v->meta_lock);
+        free(v->inodes);
+        free(v->path_index);
+        free(v->used_inodes);
+        free(v->bitmap);
+        free(v);
+        return NULL;
+    }
+
     oft_init(v);
     return v;
 }
-
 static void vfs_free_all(vfs_t* v) {
-    if (v == NULL) {
-        return;
+    if (v == NULL) return;
+    pthread_rwlock_destroy(&v->meta_lock);
+    for (uint32_t i = 0; i < VFS_MAX_INODES; i++) {
+        pthread_rwlock_destroy(&v->inode_locks[i]);
     }
     free(v->bitmap);
     free(v->used_inodes);
+    free(v->path_index);
+    free(v->inodes);
+    free(v->inode_dirty);
     free(v->free_extents);
     free(v);
 }
 
-/** Byte length of the mmap'd inode-table region. */
-static inline size_t inode_map_size(void) { return (size_t)VFS_MAX_INODES * VFS_INODE_ON_DISK_SIZE; }
-
-/**
- * Maps the on-disk inode table into memory. Replaces the previous
- * 51.5 MB pread-into-calloc-buffer mount path with a zero-copy shared
- * mapping: untouched (empty) inode pages are never faulted in, and
- * inode updates become ordinary stores visible to writeback.
- */
-static vfs_status_t inode_map_attach(vfs_t* vfs) {
-    int prot = vfs->readonly ? PROT_READ : (PROT_READ | PROT_WRITE);
-    void* p = mmap(NULL, inode_map_size(), prot, MAP_SHARED, vfs->fd, VFS_INODE_TABLE_OFFSET);
-    if (p == MAP_FAILED) {
-        return VFS_ERR_IO;
-    }
-    vfs->inodes = (vfs_inode_t*)p;
-    vfs->inode_map_len = inode_map_size();
-    return VFS_OK;
+/** Byte length of the on-disk inode-table region. */
+static inline size_t inode_table_size(void) {
+    return (size_t)VFS_MAX_INODES * VFS_INODE_ON_DISK_SIZE;
 }
 
-static void inode_map_detach(vfs_t* vfs) {
-    if (vfs->inodes != NULL && vfs->inode_map_len > 0) {
-        munmap((void*)vfs->inodes, vfs->inode_map_len);
-        vfs->inodes = NULL;
-        vfs->inode_map_len = 0;
-    }
+/**
+ * Loads the on-disk inode table into the heap buffer with pread.
+ * A short file reads as an error (never SIGBUS).
+ */
+static vfs_status_t inode_table_load(vfs_t* vfs) {
+    return pread_all(vfs->fd, vfs->inodes, inode_table_size(), VFS_INODE_TABLE_OFFSET);
 }
 
 /* =========================================================================
@@ -1088,9 +1273,10 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
     }
     vfs->readonly = false;
 
-    /* Pre-size the image to the full fixed layout so the inode table is
-     * an implicit zero extent on disk: no 51.5 MB memset/pwrite needed,
-     * and the mapping reads as zeros immediately. */
+    /* Pre-size the image to the full fixed layout. The heap inode table
+     * starts zeroed (calloc) and the on-disk table is an implicit zero
+     * hole: no 51.5 MB zero write is needed. No mmap is used, so there is
+     * no SIGBUS window even on filesystems that delay block allocation. */
     if (ftruncate(vfs->fd, VFS_DATA_OFFSET) != 0) {
         vfs_close(vfs);
         return VFS_ERR_IO;
@@ -1144,12 +1330,10 @@ vfs_status_t vfs_create(const char* image_path, vfs_t** out_vfs) {
         goto io_error;
     }
 
-    /* Inode table is implicitly zeroed by the ftruncate above; attach the
-     * mapping instead of writing 51.5 MB of zeros. */
-    s = inode_map_attach(vfs);
-    if (s != VFS_OK) {
-        goto io_error;
-    }
+    /* Heap inode table is already zeroed by vfs_alloc(); the on-disk
+     * table is an ftruncate hole that reads back as zeros. Nothing to
+     * write or map. */
+    vfs->dirty_inode_count = 0;
 
     *out_vfs = vfs;
     return VFS_OK;
@@ -1177,6 +1361,20 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
     }
     vfs->readonly = readonly;
 
+    off_t file_len = lseek(vfs->fd, 0, SEEK_END);
+    if (file_len < 0) {
+        goto io_error;
+    }
+    /* Without mmap there is no SIGBUS window, but a short file still
+     * cannot back the inode table: fail fast as corrupt instead of
+     * faulting later. */
+    if (file_len < (off_t)VFS_DATA_OFFSET) {
+        close(vfs->fd);
+        vfs->fd = -1;
+        vfs_free_all(vfs);
+        return VFS_ERR_CORRUPT;
+    }
+
     vfs_status_t s = pread_all(vfs->fd, &vfs->super, sizeof(vfs->super), (off_t)0);
     if (s != VFS_OK) {
         goto io_error;
@@ -1196,8 +1394,8 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
     };
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
         if (checks[i].disk != checks[i].expected) {
-            fprintf(stderr, "VFS corrupt: field '%s' on disk is 0x%08X, expected 0x%08X\n", checks[i].field,
-                    checks[i].disk, checks[i].expected);
+            fprintf(stderr, "VFS corrupt: field '%s' on disk is 0x%08X, expected 0x%08X\n",
+                    checks[i].field, checks[i].disk, checks[i].expected);
             close(vfs->fd);
             vfs->fd = -1;
             vfs_free_all(vfs);
@@ -1218,9 +1416,9 @@ vfs_status_t vfs_open(const char* image_path, bool readonly, vfs_t** out_vfs) {
         return VFS_ERR_NOMEM;
     }
 
-    /* Inode table: mmap instead of a 51.5 MB pread. Untouched (empty)
-     * inode pages are never faulted in. */
-    s = inode_map_attach(vfs);
+    /* Inode table: explicit pread into the heap buffer. A truncated
+     * image fails here with VFS_ERR_IO (short read), never SIGBUS. */
+    s = inode_table_load(vfs);
     if (s != VFS_OK) {
         goto io_error;
     }
@@ -1249,15 +1447,8 @@ void vfs_close(vfs_t* vfs) {
         (void)super_write_locked(vfs);
         (void)flush_bitmap_locked(vfs);
         (void)flush_all_dirty_inodes_locked(vfs);
-        /* Persist the mmap'd inode table only if it was mutated. */
-        if (vfs->inodes != NULL && vfs->inode_map_dirty) {
-            (void)msync((void*)vfs->inodes, vfs->inode_map_len, MS_SYNC);
-            vfs->inode_map_dirty = false;
-        }
         pthread_rwlock_unlock(&vfs->meta_lock);
     }
-
-    inode_map_detach(vfs);
 
     if (vfs->fd >= 0) {
         (void)close(vfs->fd);
@@ -1285,15 +1476,6 @@ vfs_status_t vfs_sync(vfs_t* vfs) {
     }
     if (s == VFS_OK) {
         s = flush_all_dirty_inodes_locked(vfs);
-    }
-    /* Persist the mmap'd inode table only when it was actually mutated:
-     * msync walks every page of the 51.5 MB range. */
-    if (s == VFS_OK && vfs->inodes != NULL && vfs->inode_map_dirty) {
-        if (msync((void*)vfs->inodes, vfs->inode_map_len, MS_SYNC) != 0) {
-            s = VFS_ERR_IO;
-        } else {
-            vfs->inode_map_dirty = false;
-        }
     }
     pthread_rwlock_unlock(&vfs->meta_lock);
     return s;
@@ -1334,6 +1516,7 @@ vfs_fd_t vfs_fopen(vfs_t* vfs, const char* path, unsigned int flags) {
             in->path[VFS_MAX_PATH - 1u] = '\0';
             in->created_at = (uint64_t)time(NULL);
             in->modified_at = in->created_at;
+            path_index_insert_locked(vfs, inode_idx);
 
             if (vfs->super.free_inode_count > 0) {
                 vfs->super.free_inode_count--;
@@ -1351,9 +1534,10 @@ vfs_fd_t vfs_fopen(vfs_t* vfs, const char* path, unsigned int flags) {
     }
 
     vfs_fd_t fd = -1;
-    for (uint32_t i = 0; i < VFS_MAX_OPEN_FILES; i++) {
+    for (uint32_t i = vfs->next_free_oft_hint; i < VFS_MAX_OPEN_FILES; i++) {
         if (vfs->oft[i].inode_idx == OFT_FREE) {
             fd = (vfs_fd_t)i;
+            vfs->next_free_oft_hint = i + 1u;
             break;
         }
     }
@@ -1387,7 +1571,8 @@ vfs_fd_t vfs_fopen(vfs_t* vfs, const char* path, unsigned int flags) {
 
     vfs->oft[(unsigned int)fd].inode_idx = (int)inode_idx;
     vfs->oft[(unsigned int)fd].flags = flags;
-    vfs->oft[(unsigned int)fd].pos = (flags & VFS_O_APPEND) ? (off_t)vfs->inodes[inode_idx].size : (off_t)0;
+    vfs->oft[(unsigned int)fd].pos =
+        (flags & VFS_O_APPEND) ? (off_t)vfs->inodes[inode_idx].size : (off_t)0;
 
     rc = (vfs_status_t)fd;
 
@@ -1407,6 +1592,9 @@ vfs_status_t vfs_fclose(vfs_t* vfs, vfs_fd_t fd) {
         pthread_rwlock_unlock(&vfs->meta_lock);
         return VFS_ERR_BADFD;
     }
+    if ((uint32_t)fd < vfs->next_free_oft_hint) {
+        vfs->next_free_oft_hint = (uint32_t)fd;
+    }
     of->inode_idx = OFT_FREE;
     of->pos = 0;
     of->flags = 0;
@@ -1423,7 +1611,8 @@ vfs_status_t vfs_fclose(vfs_t* vfs, vfs_fd_t fd) {
  * holding any VFS lock.
  */
 static vfs_status_t snapshot_extents_for_read(vfs_t* vfs, uint32_t inode_idx, vfs_extent_t* scratch,
-                                              uint32_t scratch_cap, uint32_t* out_count, uint64_t* out_size) {
+                                              uint32_t scratch_cap, uint32_t* out_count,
+                                              uint64_t* out_size) {
     pthread_rwlock_rdlock(&vfs->inode_locks[inode_idx]);
     if (out_size != NULL) {
         *out_size = vfs->inodes[inode_idx].size;
@@ -1461,8 +1650,8 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
     vfs_extent_t scratch[VFS_MAX_INLINE_EXTENTS + VFS_EXTENTS_PER_OVERFLOW_BLOCK];
     uint32_t extent_count = 0;
     uint64_t fsize = 0;
-    vfs_status_t s =
-        snapshot_extents_for_read(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count, &fsize);
+    vfs_status_t s = snapshot_extents_for_read(
+        vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count, &fsize);
     if (s != VFS_OK) {
         return s;
     }
@@ -1482,10 +1671,12 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
     while (remaining > 0) {
         uint32_t block_idx = (uint32_t)((uint64_t)cur_pos / VFS_BLOCK_SIZE);
         uint32_t block_off = (uint32_t)((uint64_t)cur_pos % VFS_BLOCK_SIZE);
-        uint32_t max_logical = (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
+        uint32_t max_logical =
+            (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
 
         uint32_t physical_start = 0, run_blocks = 0;
-        extents_resolve_read(scratch, extent_count, block_idx, max_logical, &physical_start, &run_blocks);
+        extents_resolve_read(scratch, extent_count, block_idx, max_logical, &physical_start,
+                             &run_blocks);
 
         size_t run_bytes = ((size_t)run_blocks * VFS_BLOCK_SIZE) - block_off;
         if (run_bytes > remaining) {
@@ -1525,20 +1716,21 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
  * dirty. Takes the inode's write lock for the duration of the mutation
  * (not for the I/O that follows in the caller).
  */
-static vfs_status_t inode_apply_new_extent(vfs_t* vfs, uint32_t inode_idx, uint32_t logical, uint32_t physical,
-                                           uint32_t length) {
+static vfs_status_t inode_apply_new_extent(vfs_t* vfs, uint32_t inode_idx, uint32_t logical,
+                                           uint32_t physical, uint32_t length) {
     pthread_rwlock_wrlock(&vfs->inode_locks[inode_idx]);
 
     vfs_extent_t scratch[VFS_MAX_INLINE_EXTENTS + VFS_EXTENTS_PER_OVERFLOW_BLOCK];
     uint32_t count = 0;
-    vfs_status_t s = extents_load(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &count);
+    vfs_status_t s =
+        extents_load(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &count);
     if (s != VFS_OK) {
         pthread_rwlock_unlock(&vfs->inode_locks[inode_idx]);
         return s;
     }
 
-    uint32_t new_count =
-        extents_insert_local(scratch, count, sizeof(scratch) / sizeof(scratch[0]), logical, physical, length);
+    uint32_t new_count = extents_insert_local(scratch, count, sizeof(scratch) / sizeof(scratch[0]),
+                                              logical, physical, length);
     if (new_count == UINT32_MAX) {
         pthread_rwlock_unlock(&vfs->inode_locks[inode_idx]);
         return VFS_ERR_OVERFLOW;
@@ -1555,7 +1747,8 @@ static vfs_status_t inode_apply_new_extent(vfs_t* vfs, uint32_t inode_idx, uint3
     return s;
 }
 
-vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, size_t* bytes_written) {
+vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count,
+                        size_t* bytes_written) {
     if (vfs == NULL || buf == NULL || bytes_written == NULL) {
         return VFS_ERR_INVAL;
     }
@@ -1593,7 +1786,8 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
      * so in-place overwrites skip all per-chunk extent reloads. */
     vfs_extent_t scratch[VFS_MAX_INLINE_EXTENTS + VFS_EXTENTS_PER_OVERFLOW_BLOCK];
     uint32_t extent_count = 0;
-    rc = snapshot_extents_for_read(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count, NULL);
+    rc = snapshot_extents_for_read(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]),
+                                   &extent_count, NULL);
     if (rc != VFS_OK) {
         *bytes_written = 0;
         return rc;
@@ -1605,8 +1799,10 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
         bool full_block_overwrite = (block_off == 0) && (remaining >= VFS_BLOCK_SIZE);
 
         uint32_t existing_phys = 0, existing_run = 0;
-        uint32_t max_logical = (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
-        extents_resolve_read(scratch, extent_count, block_idx, max_logical, &existing_phys, &existing_run);
+        uint32_t max_logical =
+            (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
+        extents_resolve_read(scratch, extent_count, block_idx, max_logical, &existing_phys,
+                             &existing_run);
 
         size_t run_bytes;
         uint32_t phys_start;
@@ -1622,7 +1818,8 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
         } else {
             /* Hole: allocate a new contiguous physical run sized to the
              * unallocated span, capped by the allocator's own limits. */
-            uint32_t want_len = existing_run; /* Hole length in blocks, from extents_resolve_read. */
+            uint32_t want_len =
+                existing_run; /* Hole length in blocks, from extents_resolve_read. */
             pthread_rwlock_wrlock(&vfs->meta_lock);
             uint32_t new_phys = 0, alloc_len = 0;
             rc = block_alloc_run_locked(vfs, want_len, &new_phys, &alloc_len);
@@ -1644,14 +1841,16 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
              * whole-block run entirely covered by `remaining` needs no
              * zeroing at all -- the caller's data covers every byte.
              */
-            bool covers_whole_run = full_block_overwrite && (run_bytes == (size_t)alloc_len * VFS_BLOCK_SIZE);
+            bool covers_whole_run =
+                full_block_overwrite && (run_bytes == (size_t)alloc_len * VFS_BLOCK_SIZE);
             if (!covers_whole_run) {
                 for (uint32_t i = 0; i < alloc_len; i++) {
                     uint32_t blk_logical_off = i * VFS_BLOCK_SIZE;
                     /* Skip zeroing a block that this write will cover completely. */
                     size_t blk_start_in_run = (i == 0) ? 0 : (size_t)blk_logical_off - block_off;
-                    bool fully_covered = (i == 0) ? (block_off == 0 && run_bytes >= VFS_BLOCK_SIZE)
-                                                  : (blk_start_in_run + VFS_BLOCK_SIZE <= run_bytes);
+                    bool fully_covered = (i == 0)
+                                             ? (block_off == 0 && run_bytes >= VFS_BLOCK_SIZE)
+                                             : (blk_start_in_run + VFS_BLOCK_SIZE <= run_bytes);
                     if (!fully_covered) {
                         rc = block_zero(vfs->fd, new_phys + i);
                         if (rc != VFS_OK) {
@@ -1673,9 +1872,9 @@ vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, 
             }
             /* Mirror the new extent into the local snapshot so subsequent
              * chunks resolve against the up-to-date map. */
-            uint32_t merged = extents_insert_local(scratch, extent_count,
-                                                   sizeof(scratch) / sizeof(scratch[0]), block_idx, new_phys,
-                                                   alloc_len);
+            uint32_t merged =
+                extents_insert_local(scratch, extent_count, sizeof(scratch) / sizeof(scratch[0]),
+                                     block_idx, new_phys, alloc_len);
             if (merged != UINT32_MAX) {
                 extent_count = merged;
             }
@@ -1710,6 +1909,205 @@ write_done:
     pthread_rwlock_unlock(&vfs->meta_lock);
 
     return rc;
+}
+
+/* Cap for a single copy_file_range(2) call: keeps each call well under
+ * per-call limits on older kernels while staying large enough that a
+ * multi-hundred-MiB file needs only a handful of calls. */
+#define VFS_COPY_RANGE_MAX ((size_t)0x40000000u)
+
+/* Fallback streaming chunk when the kernel cannot copy the range
+ * directly (cross-filesystem, non-supporting fs, ...). */
+#define VFS_COPY_FALLBACK_CHUNK ((size_t)(1024u * 1024u))
+
+/**
+ * Copies exactly @p n bytes from @p in_fd at *@p in_off to @p out_fd at
+ * @p out_off, trying copy_file_range(2) first and falling back to
+ * pread/pwrite streaming for the remainder when the kernel reports the
+ * copy cannot be performed that way.
+ *
+ * copy_file_range() never maps the source into userspace, so a source
+ * file that shrinks concurrently surfaces as a short copy (error here),
+ * never SIGBUS. On same-filesystem btrfs/xfs targets the kernel may
+ * satisfy the copy as a metadata-only extent share (reflink), which is
+ * semantically an identical copy thanks to copy-on-write.
+ *
+ * @p fallback_buf may be NULL: it is allocated lazily (once) only if the
+ * fallback path is actually needed. On success *@p fallback_buf holds the
+ * buffer (caller frees) or stays NULL when never needed.
+ */
+static vfs_status_t copy_fd_range(int in_fd, off_t* in_off, int out_fd, off_t out_off, size_t n,
+                                  uint8_t** fallback_buf) {
+    size_t rem = n;
+    while (rem > 0) {
+        size_t want = (rem < VFS_COPY_RANGE_MAX) ? rem : VFS_COPY_RANGE_MAX;
+        off_t dst = out_off;
+#if defined(__linux__)
+        ssize_t got = copy_file_range(in_fd, in_off, out_fd, &dst, want, 0u);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EXDEV || errno == EINVAL || errno == ENOSYS ||
+                errno == EOPNOTSUPP || errno == EPERM) {
+                break; /* Fall through to the buffered copy below. */
+            }
+            return VFS_ERR_IO;
+        }
+        if (got == 0) {
+            return VFS_ERR_IO; /* Source hit EOF early (shrunk concurrently). */
+        }
+        out_off = dst;
+        rem -= (size_t)got;
+        continue;
+#else
+        (void)in_fd;
+        (void)in_off;
+        (void)out_fd;
+        (void)dst;
+        (void)want;
+        break;
+#endif
+    }
+
+    while (rem > 0) {
+        if (*fallback_buf == NULL) {
+            *fallback_buf = malloc(VFS_COPY_FALLBACK_CHUNK);
+            if (*fallback_buf == NULL) {
+                return VFS_ERR_NOMEM;
+            }
+        }
+        size_t chunk = (rem < VFS_COPY_FALLBACK_CHUNK) ? rem : VFS_COPY_FALLBACK_CHUNK;
+        vfs_status_t s = pread_all(in_fd, *fallback_buf, chunk, *in_off);
+        if (s != VFS_OK) {
+            return s;
+        }
+        s = pwrite_all(out_fd, *fallback_buf, chunk, out_off);
+        if (s != VFS_OK) {
+            return s;
+        }
+        *in_off += (off_t)chunk;
+        out_off += (off_t)chunk;
+        rem -= chunk;
+    }
+    return VFS_OK;
+}
+
+/**
+ * Bulk-imports @p size bytes from host descriptor @p host_fd (read from
+ * offset 0) into the VFS file @p fd, appending at the file's current end
+ * (callers pass a freshly created/truncated file, so position 0).
+ *
+ * Unlike a vfs_fwrite() loop, this allocates storage
+ * extent-by-extent and moves each whole extent with a single kernel-side
+ * copy_file_range() call: a 346 MiB contiguous file typically needs one
+ * allocator pass, one extent record, and one copy call. No userspace data
+ * bounce, no per-MiB lock round-trips, and on reflink-capable
+ * filesystems the data may not move at all.
+ */
+static vfs_status_t vfs_import_fd_inner(vfs_t* vfs, uint32_t inode_idx, int host_fd,
+                                        uint64_t size, uint64_t* out_copied) {
+    uint8_t* fallback_buf = NULL;
+    off_t host_off = 0;
+    uint64_t copied = 0;
+    uint32_t logical = 0;
+    vfs_status_t rc = VFS_OK;
+
+    while (copied < size) {
+        uint64_t left = size - copied;
+        uint32_t want_blocks =
+            (uint32_t)((left + (uint64_t)VFS_BLOCK_SIZE - 1u) / (uint64_t)VFS_BLOCK_SIZE);
+
+        pthread_rwlock_wrlock(&vfs->meta_lock);
+        uint32_t new_phys = 0, alloc_len = 0;
+        rc = block_alloc_run_locked(vfs, want_blocks, &new_phys, &alloc_len);
+        pthread_rwlock_unlock(&vfs->meta_lock);
+        if (rc != VFS_OK) {
+            break;
+        }
+
+        size_t run_bytes = (size_t)alloc_len * VFS_BLOCK_SIZE;
+        if ((uint64_t)run_bytes > left) {
+            run_bytes = (size_t)left;
+        }
+
+        /* Freshly allocated blocks of a sparse image read as zeros, so a
+         * short final block needs no pre-zeroing: copying exactly
+         * run_bytes leaves the [size, block-end) tail as zeros. */
+        rc = copy_fd_range(host_fd, &host_off, vfs->fd, block_offset(new_phys), run_bytes,
+                           &fallback_buf);
+        if (rc != VFS_OK) {
+            pthread_rwlock_wrlock(&vfs->meta_lock);
+            block_free_run_locked(vfs, new_phys, alloc_len);
+            pthread_rwlock_unlock(&vfs->meta_lock);
+            break;
+        }
+
+        rc = inode_apply_new_extent(vfs, inode_idx, logical, new_phys, alloc_len);
+        if (rc != VFS_OK) {
+            pthread_rwlock_wrlock(&vfs->meta_lock);
+            block_free_run_locked(vfs, new_phys, alloc_len);
+            pthread_rwlock_unlock(&vfs->meta_lock);
+            break;
+        }
+
+        copied += (uint64_t)run_bytes;
+        logical += alloc_len;
+    }
+
+    free(fallback_buf);
+    *out_copied = copied;
+    return rc;
+}
+
+vfs_status_t vfs_import_fd(vfs_t* vfs, vfs_fd_t fd, int host_fd, uint64_t size) {
+    if (vfs == NULL || host_fd < 0) {
+        return VFS_ERR_INVAL;
+    }
+    if (size == 0) {
+        return VFS_OK;
+    }
+    if (vfs->readonly) {
+        return VFS_ERR_READONLY;
+    }
+    if (size > (uint64_t)VFS_TOTAL_BLOCKS * (uint64_t)VFS_BLOCK_SIZE) {
+        return VFS_ERR_OVERFLOW;
+    }
+
+    pthread_rwlock_wrlock(&vfs->meta_lock);
+    open_file_t* of = oft_get_locked(vfs, fd);
+    if (of == NULL) {
+        pthread_rwlock_unlock(&vfs->meta_lock);
+        return VFS_ERR_BADFD;
+    }
+    if (!(of->flags & (VFS_O_WRONLY | VFS_O_RDWR))) {
+        pthread_rwlock_unlock(&vfs->meta_lock);
+        return VFS_ERR_INVAL;
+    }
+    uint32_t inode_idx = (uint32_t)of->inode_idx;
+    pthread_rwlock_unlock(&vfs->meta_lock);
+
+    vfs_status_t rc;
+    uint64_t bytes_copied = 0;
+    rc = vfs_import_fd_inner(vfs, inode_idx, host_fd, size, &bytes_copied);
+    if (rc != VFS_OK) {
+        return rc;
+    }
+
+    pthread_rwlock_wrlock(&vfs->meta_lock);
+    of = oft_get_locked(vfs, fd);
+    if (of != NULL) {
+        vfs_inode_t* in = &vfs->inodes[inode_idx];
+        if ((uint64_t)bytes_copied > in->size) {
+            in->size = (uint64_t)bytes_copied;
+        }
+        in->modified_at = (uint64_t)time(NULL);
+        of->pos = (off_t)bytes_copied;
+        (void)inode_mark_dirty_locked(vfs, inode_idx);
+    }
+    pthread_rwlock_unlock(&vfs->meta_lock);
+
+    return ((uint64_t)bytes_copied == size) ? VFS_OK : VFS_ERR_IO;
 }
 
 vfs_status_t vfs_fseek(vfs_t* vfs, vfs_fd_t fd, off_t offset, int whence, off_t* new_offset) {
@@ -1865,7 +2263,8 @@ vfs_status_t vfs_truncate(vfs_t* vfs, const char* path, uint64_t length) {
                 if (zeros == NULL) {
                     rc = VFS_ERR_NOMEM;
                 } else {
-                    rc = pwrite_all(vfs->fd, zeros, tail_len, block_offset(last_phys) + (off_t)tail_off);
+                    rc = pwrite_all(vfs->fd, zeros, tail_len,
+                                    block_offset(last_phys) + (off_t)tail_off);
                     free(zeros);
                 }
             }
@@ -1930,12 +2329,16 @@ vfs_status_t vfs_unlink(vfs_t* vfs, const char* path) {
             vfs->oft[i].inode_idx = OFT_FREE;
             vfs->oft[i].pos = 0;
             vfs->oft[i].flags = 0;
+            if (i < vfs->next_free_oft_hint) {
+                vfs->next_free_oft_hint = i;
+            }
         }
     }
     pthread_rwlock_unlock(&vfs->meta_lock);
 
     pthread_rwlock_wrlock(&vfs->inode_locks[idx]);
     pthread_rwlock_wrlock(&vfs->meta_lock);
+    path_index_remove_locked(vfs, path);
     vfs_status_t rc = inode_free_all_blocks_locked(vfs, idx);
     if (rc == VFS_OK) {
         used_index_remove_locked(vfs, idx);
@@ -1965,7 +2368,8 @@ void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* user
         return;
     }
 
-    bool match_all = (prefix == NULL || prefix[0] == '\0' || (prefix[0] == '/' && prefix[1] == '\0'));
+    bool match_all =
+        (prefix == NULL || prefix[0] == '\0' || (prefix[0] == '/' && prefix[1] == '\0'));
     size_t prefix_len = match_all ? 0u : strlen(prefix);
 
     pthread_rwlock_rdlock(&vfs->meta_lock);
@@ -1989,7 +2393,7 @@ void vfs_list(vfs_t* vfs, const char* prefix, vfs_list_cb_t callback, void* user
         st.path[VFS_MAX_PATH - 1u] = '\0';
 
         pthread_rwlock_unlock(&vfs->meta_lock);
-        bool cont = callback(in->path, &st, userdata);
+        bool cont = callback(st.path, &st, userdata);
         pthread_rwlock_rdlock(&vfs->meta_lock);
 
         if (!cont) {
@@ -2034,8 +2438,12 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath) {
                 vfs->oft[i].inode_idx = OFT_FREE;
                 vfs->oft[i].pos = 0;
                 vfs->oft[i].flags = 0;
+                if (i < vfs->next_free_oft_hint) {
+                    vfs->next_free_oft_hint = i;
+                }
             }
         }
+        path_index_remove_locked(vfs, newpath);
         rc = inode_free_all_blocks_locked(vfs, dst_idx);
         if (rc != VFS_OK) {
             goto out;
@@ -2044,9 +2452,11 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath) {
     }
 
     vfs_inode_t* src = &vfs->inodes[src_idx];
+    path_index_remove_locked(vfs, oldpath);
     memset(src->path, 0, VFS_MAX_PATH);
     memcpy(src->path, newpath, new_len);
     src->modified_at = (uint64_t)time(NULL);
+    path_index_insert_locked(vfs, src_idx);
     rc = inode_mark_dirty_locked(vfs, src_idx);
     /* Rename does not need to touch the superblock; only the inode changed. */
 
@@ -2060,7 +2470,8 @@ out:
  * Public API - sendfile
  * ======================================================================= */
 
-vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count, size_t* bytes_sent) {
+vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count,
+                          size_t* bytes_sent) {
     if (vfs == NULL || out_fd < 0 || bytes_sent == NULL) {
         return VFS_ERR_INVAL;
     }
@@ -2086,8 +2497,8 @@ vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset,
     vfs_extent_t scratch[VFS_MAX_INLINE_EXTENTS + VFS_EXTENTS_PER_OVERFLOW_BLOCK];
     uint32_t extent_count = 0;
     uint64_t fsize = 0;
-    vfs_status_t rc =
-        snapshot_extents_for_read(vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count, &fsize);
+    vfs_status_t rc = snapshot_extents_for_read(
+        vfs, inode_idx, scratch, sizeof(scratch) / sizeof(scratch[0]), &extent_count, &fsize);
     if (rc != VFS_OK) {
         return rc;
     }
@@ -2106,10 +2517,12 @@ vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset,
     while (remaining > 0) {
         uint32_t block_idx = (uint32_t)((uint64_t)cur_pos / VFS_BLOCK_SIZE);
         uint32_t block_off = (uint32_t)((uint64_t)cur_pos % VFS_BLOCK_SIZE);
-        uint32_t max_logical = (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
+        uint32_t max_logical =
+            (uint32_t)((remaining + block_off + VFS_BLOCK_SIZE - 1u) / VFS_BLOCK_SIZE);
 
         uint32_t phys_start = 0, run_blocks = 0;
-        extents_resolve_read(scratch, extent_count, block_idx, max_logical, &phys_start, &run_blocks);
+        extents_resolve_read(scratch, extent_count, block_idx, max_logical, &phys_start,
+                             &run_blocks);
 
         size_t run_bytes = (size_t)run_blocks * VFS_BLOCK_SIZE - block_off;
         if (run_bytes > remaining) {
@@ -2275,8 +2688,10 @@ void vfs_dump(const vfs_t* vfs, FILE* out) {
         if (in->path[0] == '\0') {
             continue;
         }
-        fprintf(out, "  [%4u] path=%-32s size=%-10" PRIu64 " blocks=%-4u extents=%-3u mtime=%" PRIu64 "\n", i, in->path,
-                in->size, in->block_count, in->extent_count, in->modified_at);
+        fprintf(out,
+                "  [%4u] path=%-32s size=%-10" PRIu64 " blocks=%-4u extents=%-3u mtime=%" PRIu64
+                "\n",
+                i, in->path, in->size, in->block_count, in->extent_count, in->modified_at);
     }
 
     fprintf(out, "\n=== Open-file Table ===\n");
@@ -2285,8 +2700,8 @@ void vfs_dump(const vfs_t* vfs, FILE* out) {
         if (of->inode_idx == OFT_FREE) {
             continue;
         }
-        fprintf(out, "  fd=%-3u inode=%-4d pos=%-10" PRId64 " flags=0x%02X\n", i, of->inode_idx, (int64_t)of->pos,
-                of->flags);
+        fprintf(out, "  fd=%-3u inode=%-4d pos=%-10" PRId64 " flags=0x%02X\n", i, of->inode_idx,
+                (int64_t)of->pos, of->flags);
     }
 
     fflush(out);
@@ -2343,7 +2758,7 @@ void* vfs_read_file(vfs_t* vfs, const char* path, size_t* out_size) {
         return malloc(1);
     }
 
-    void* data = malloc(st.size);
+    char* data = malloc(st.size + 1);
     if (data == NULL) {
         vfs_fclose(vfs, fd);
         return NULL;
@@ -2357,11 +2772,13 @@ void* vfs_read_file(vfs_t* vfs, const char* path, size_t* out_size) {
         return NULL;
     }
 
+    data[bytes_read] = '\0';
     *out_size = bytes_read;
     return data;
 }
 
-vfs_status_t vfs_open_embedded(const void* embed_data, size_t embed_size, bool readonly, vfs_t** out_vfs) {
+vfs_status_t vfs_open_embedded(const void* embed_data, size_t embed_size, bool readonly,
+                               vfs_t** out_vfs) {
     if (embed_data == NULL || embed_size == 0 || out_vfs == NULL) {
         return VFS_ERR_INVAL;
     }
@@ -2379,6 +2796,13 @@ vfs_status_t vfs_open_embedded(const void* embed_data, size_t embed_size, bool r
         return VFS_ERR_IO;
     }
 
+    /* Ensure the temporary descriptor has the minimum layout size */
+    if (embed_size < VFS_DATA_OFFSET) {
+        if (ftruncate(mem_fd, VFS_DATA_OFFSET) != 0) {
+            close(mem_fd);
+            return VFS_ERR_IO;
+        }
+    }
     const uint8_t* src = (const uint8_t*)embed_data;
     size_t remaining = embed_size;
     while (remaining > 0) {

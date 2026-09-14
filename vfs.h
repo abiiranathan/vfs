@@ -136,16 +136,16 @@ extern "C" {
  * May be overridden at compile time via: -DVFS_MAX_INODES=<count>
  */
 #ifndef VFS_MAX_INODES
-    #define VFS_MAX_INODES 65536u
+#define VFS_MAX_INODES 65536u
 #endif
 
 /* Compile-time validation of user-supplied overrides */
 #if (VFS_MAX_INODES < VFS_ABSOLUTE_MIN_INODES)
-    #error "VFS_MAX_INODES must be at least 1."
+#error "VFS_MAX_INODES must be at least 1."
 #endif
 
 #if (VFS_MAX_INODES > VFS_ABSOLUTE_MAX_INODES)
-    #error "VFS_MAX_INODES exceeds the maximum supported limit (65536)."
+#error "VFS_MAX_INODES exceeds the maximum supported limit (65536)."
 #endif
 
 /** Maximum file-path length including the NUL terminator. */
@@ -199,13 +199,6 @@ extern "C" {
 
 /** Byte offset of the first data block inside the image. */
 #define VFS_DATA_OFFSET (VFS_INODE_TABLE_OFFSET + ((off_t)VFS_MAX_INODES * VFS_INODE_ON_DISK_SIZE))
-
-/**
- * Metadata writeback is batched. A flush is forced when the number of
- * dirty inodes reaches this threshold, bounding the amount of data that
- * could be lost if the process is killed without a clean vfs_close().
- */
-#define VFS_DIRTY_INODE_FLUSH_THRESHOLD 64u
 
 /* -------------------------------------------------------------------------
  * Error codes
@@ -269,14 +262,14 @@ typedef struct __attribute__((packed)) {
  * A zero `path[0]` byte means the slot is free.
  */
 typedef struct __attribute__((packed)) {
-    char path[VFS_MAX_PATH];                      /**< Absolute virtual path, NUL-terminated. */
-    uint64_t size;                                /**< Logical file size in bytes.            */
-    uint64_t created_at;                          /**< Creation timestamp (Unix seconds).     */
-    uint64_t modified_at;                         /**< Last-write timestamp (Unix seconds).   */
-    uint32_t block_count;                         /**< Number of allocated physical blocks.   */
-    uint32_t extent_count;                        /**< Number of extents in use, inline + overflow. */
-    uint32_t inline_extent_count;                 /**< Number of extents stored inline here.  */
-    uint32_t overflow_block;                      /**< First overflow extent block, or 0 = none. */
+    char path[VFS_MAX_PATH];      /**< Absolute virtual path, NUL-terminated. */
+    uint64_t size;                /**< Logical file size in bytes.            */
+    uint64_t created_at;          /**< Creation timestamp (Unix seconds).     */
+    uint64_t modified_at;         /**< Last-write timestamp (Unix seconds).   */
+    uint32_t block_count;         /**< Number of allocated physical blocks.   */
+    uint32_t extent_count;        /**< Number of extents in use, inline + overflow. */
+    uint32_t inline_extent_count; /**< Number of extents stored inline here.  */
+    uint32_t overflow_block;      /**< First overflow extent block, or 0 = none. */
     vfs_extent_t extents[VFS_MAX_INLINE_EXTENTS]; /**< Sorted by logical_block, ascending.    */
     uint8_t _pad[16];                             /**< Reserved for future fields.            */
 } vfs_inode_t;
@@ -430,7 +423,8 @@ vfs_status_t vfs_fread(vfs_t* vfs, vfs_fd_t fd, void* buf, size_t count, size_t*
  * @param[out] bytes_written  Bytes actually written. Never NULL.
  * @return VFS_OK or a negative vfs_status_t (VFS_ERR_NOSPACE, VFS_ERR_OVERFLOW...).
  */
-vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count, size_t* bytes_written);
+vfs_status_t vfs_fwrite(vfs_t* vfs, vfs_fd_t fd, const void* buf, size_t count,
+                        size_t* bytes_written);
 
 /**
  * Repositions the read/write cursor for @p fd.
@@ -572,7 +566,8 @@ vfs_status_t vfs_rename(vfs_t* vfs, const char* oldpath, const char* newpath);
  *       @p in_fd from different threads are serialised by the file's
  *       per-inode lock; calls on different files proceed in parallel.
  */
-vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count, size_t* bytes_sent);
+vfs_status_t vfs_sendfile(vfs_t* vfs, int out_fd, vfs_fd_t in_fd, off_t* offset, size_t count,
+                          size_t* bytes_sent);
 
 /* -------------------------------------------------------------------------
  * Utility
@@ -634,6 +629,34 @@ vfs_status_t vfs_append_file(vfs_t* vfs, const char* path, const void* data, siz
 void* vfs_read_file(vfs_t* vfs, const char* path, size_t* out_size);
 
 /**
+ * @brief Bulk-imports @p size bytes from host descriptor @p host_fd into @p fd.
+ *
+ * Combines allocation and data movement in one call: storage is reserved
+ * extent-by-extent and each whole extent is moved with a single
+ * kernel-side copy_file_range() call instead of a userspace read/pwrite
+ * loop, so a large contiguous file typically costs one allocator pass,
+ * one extent record, and one copy call. Never maps the source into
+ * userspace (a concurrently shrinking source fails as VFS_ERR_IO, never
+ * SIGBUS). On reflink-capable filesystems the kernel may satisfy the copy
+ * as a metadata-only extent share, which stays semantically identical
+ * thanks to copy-on-write.
+ *
+ * Bytes are read from @p host_fd starting at offset 0 and appended at the
+ * file's current end; bulk importers pass a freshly created/truncated @p fd.
+ * If the kernel cannot copy the range directly (cross-filesystem, ...),
+ * this transparently falls back to pread/pwrite streaming.
+ *
+ * @param vfs      Mounted VFS handle.
+ * @param fd       Open file descriptor (must have write permission).
+ * @param host_fd  Source host file descriptor (regular file).
+ * @param size     Total bytes to import from offset 0 of @p host_fd.
+ * @return VFS_OK on success (exactly @p size bytes imported), or a negative
+ *         vfs_status_t (VFS_ERR_NOSPACE, VFS_ERR_OVERFLOW, VFS_ERR_IO, ...).
+ *         A short source (shrink race) reports VFS_ERR_IO.
+ */
+vfs_status_t vfs_import_fd(vfs_t* vfs, vfs_fd_t fd, int host_fd, uint64_t size);
+
+/**
  * @brief Mounts a read-only or read-write VFS directly from a static memory array.
  *
  * @param embed_data Pointer to the embedded static byte array (e.g., asset_vfs_bytes).
@@ -642,11 +665,13 @@ void* vfs_read_file(vfs_t* vfs, const char* path, size_t* out_size);
  * @param out_vfs    Pointer populated with the resulting initialized vfs_t handle.
  * @return VFS_OK, VFS_ERR_IO, or VFS_ERR_INVAL.
  */
-vfs_status_t vfs_open_embedded(const void* embed_data, size_t embed_size, bool readonly, vfs_t** out_vfs);
+vfs_status_t vfs_open_embedded(const void* embed_data, size_t embed_size, bool readonly,
+                               vfs_t** out_vfs);
 
 static_assert(sizeof(vfs_extent_t) == 16, "vfs_extent_t size must be exactly 16 bytes");
 static_assert(sizeof(vfs_inode_t) == VFS_INODE_ON_DISK_SIZE, "vfs_inode_t size mismatch");
-static_assert(sizeof(vfs_super_t) <= VFS_SUPERBLOCK_SIZE, "vfs_super_t exceeds VFS_SUPERBLOCK_SIZE");
+static_assert(sizeof(vfs_super_t) <= VFS_SUPERBLOCK_SIZE,
+              "vfs_super_t exceeds VFS_SUPERBLOCK_SIZE");
 
 #if defined(__cplusplus)
 }
