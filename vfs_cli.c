@@ -1103,8 +1103,11 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* No subcommand selected (e.g. bare `vfs` or only global flags). */
-    if (!flag_active_subcommand(root)) {
+    /* No subcommand selected (e.g. bare `vfs` or only global flags):
+     * flag_active_subcommand() returns the deepest selected leaf, which
+     * is the root parser itself when nothing was selected -- so compare
+     * against root instead of null-checking. */
+    if (flag_active_subcommand(root) == root) {
         flag_print_usage(root);
         return EXIT_FAILURE;
     }

@@ -126,7 +126,14 @@ install: all
 	$(MKDIR) $(DESTDIR)$(INCLUDEDIR)
 	$(INSTALL) -m 644 $(LIB_NAME) $(DESTDIR)$(LIBDIR)/libvfs.a
 	$(INSTALL) -m 644 vfs.h $(DESTDIR)$(INCLUDEDIR)/vfs.h
+	if [ -f "$(CLI_BIN)" ]; then \
+		$(MKDIR) $(DESTDIR)$(BINDIR); \
+		$(INSTALL) -m 755 $(CLI_BIN) $(DESTDIR)$(BINDIR)/vfs-cli; \
+	fi
 
 uninstall:
 	$(RM) $(DESTDIR)$(LIBDIR)/libvfs.a
 	$(RM) $(DESTDIR)$(INCLUDEDIR)/vfs.h
+	if [ -f "$(DESTDIR)$(BINDIR)/vfs-cli" ]; then \
+		$(RM) $(DESTDIR)$(BINDIR)/vfs-cli; \
+	fi

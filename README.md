@@ -60,11 +60,11 @@
 
 Modern high-performance applications often need to manage thousands of assets, logs, tenant containers, or database partitions. Relying directly on the host OS filesystem or traditional archives presents severe trade-offs:
 
-| Storage Approach                     | Limitations & Bottlenecks                                                                                                                           |
-| :----------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Host OS Filesystem (Loose Files)** | Inode exhaustion, host filesystem fragmentation, sluggish directory walks, difficult atomic backups, and slow container deployments.                |
-| **ZIP / TAR Archives**               | Read-only or append-only; in-place overwrites, truncations, and random-access writes require rewriting the entire archive.                          |
-| **SQLite BLOBs**                     | High overhead from SQL query parsing, write-ahead logging (WAL) amplification, and inability to perform zero-copy kernel transfers (`sendfile(2)`). |
+| Storage Approach                     | Limitations & Bottlenecks                                                                                                                                |
+| :----------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Host OS Filesystem (Loose Files)** | Inode exhaustion, host filesystem fragmentation, sluggish directory walks, difficult atomic backups, and slow container deployments.                     |
+| **ZIP / TAR Archives**               | Read-only or append-only; in-place overwrites, truncations, and random-access writes require rewriting the entire archive.                               |
+| **SQLite BLOBs**                     | High overhead from SQL query parsing, write-ahead logging (WAL) amplification, and inability to perform zero-copy kernel transfers (`sendfile(2)`).      |
 | **VFS v3 (This Engine)**             | **Single host file, fully read-write, extent-indexed, O(1) path lookups, per-inode concurrency, kernel-side bulk transfer, zero-copy socket streaming.** |
 
 ---
@@ -198,19 +198,19 @@ Global convention: `-c/--container` selects the image, `-d/--dir` a host directo
 
 ### Commands
 
-| Command   | Syntax                                            | Description                                                        |
-| :-------- | :------------------------------------------------ | :----------------------------------------------------------------- |
-| `create`  | `vfs create -c image.vfs`                         | Create an empty image (overwrites an existing file).               |
-| `pack`    | `vfs pack -c image.vfs -d ./src [-v] [-j N]`      | Create image and import a host directory tree (parallel).          |
-| `unpack`  | `vfs unpack -c image.vfs -d ./out [-v] [-j N]`    | Extract every file to a host directory (parallel).                 |
-| `ls`      | `vfs ls -c image.vfs [prefix]`                    | List files whose virtual path starts with `prefix` (default `/`). |
-| `add`     | `vfs add -c image.vfs <host_src> <vfs_dst>`       | Import one host file (creates or truncates the destination).       |
-| `extract` | `vfs extract -c image.vfs <vfs_src> <host_dst>`   | Export one file to the host.                                       |
-| `rm`      | `vfs rm -c image.vfs <vfs_path>`                  | Delete a file, freeing its blocks.                                 |
-| `mv`      | `vfs mv -c image.vfs <vfs_old> <vfs_new>`         | Rename/move; replaces the destination like POSIX `rename(2)`.      |
-| `stat`    | `vfs stat -c image.vfs <vfs_path>`                | Show size, blocks, creation/modification times.                    |
-| `exists`  | `vfs exists -c image.vfs <vfs_path>`              | Print `exists`/`missing` (exit code usable in scripts).            |
-| `dump`    | `vfs dump -c image.vfs`                           | Superblock, free-extent and inode-table diagnostics.               |
+| Command   | Syntax                                          | Description                                                       |
+| :-------- | :---------------------------------------------- | :---------------------------------------------------------------- |
+| `create`  | `vfs create -c image.vfs`                       | Create an empty image (overwrites an existing file).              |
+| `pack`    | `vfs pack -c image.vfs -d ./src [-v] [-j N]`    | Create image and import a host directory tree (parallel).         |
+| `unpack`  | `vfs unpack -c image.vfs -d ./out [-v] [-j N]`  | Extract every file to a host directory (parallel).                |
+| `ls`      | `vfs ls -c image.vfs [prefix]`                  | List files whose virtual path starts with `prefix` (default `/`). |
+| `add`     | `vfs add -c image.vfs <host_src> <vfs_dst>`     | Import one host file (creates or truncates the destination).      |
+| `extract` | `vfs extract -c image.vfs <vfs_src> <host_dst>` | Export one file to the host.                                      |
+| `rm`      | `vfs rm -c image.vfs <vfs_path>`                | Delete a file, freeing its blocks.                                |
+| `mv`      | `vfs mv -c image.vfs <vfs_old> <vfs_new>`       | Rename/move; replaces the destination like POSIX `rename(2)`.     |
+| `stat`    | `vfs stat -c image.vfs <vfs_path>`              | Show size, blocks, creation/modification times.                   |
+| `exists`  | `vfs exists -c image.vfs <vfs_path>`            | Print `exists`/`missing` (exit code usable in scripts).           |
+| `dump`    | `vfs dump -c image.vfs`                         | Superblock, free-extent and inode-table diagnostics.              |
 
 ### Exit Codes & Output Conventions
 
@@ -257,67 +257,67 @@ Link against `lib/libvfs.a` plus `-lpthread` (defines: `_GNU_SOURCE` for `copy_f
 
 ### Lifecycle
 
-| Function                                                          | Description                                                                                       |
-| :---------------------------------------------------------------- | :------------------------------------------------------------------------------------------------ |
-| `vfs_create(path, &vfs)`                                          | Create (overwrite) an image and mount it read-write. Caller must `vfs_close()`.                   |
-| `vfs_open(path, readonly, &vfs)`                                  | Mount an existing image. Short/corrupt images fail with `VFS_ERR_CORRUPT`, never `SIGBUS`. Caller must `vfs_close()`. |
-| `vfs_close(vfs)`                                                  | Flush (unless read-only) and free the handle. `NULL` is a no-op.                                  |
-| `vfs_sync(vfs)`                                                   | Flush superblock, bitmap, and dirty inodes to the host file. No-op success when read-only.        |
-| `vfs_open_embedded(data, size, readonly, &vfs)`                   | Mount from a static memory array via an anonymous `memfd` (Linux) — ideal for linked-in assets.   |
+| Function                                        | Description                                                                                                           |
+| :---------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+| `vfs_create(path, &vfs)`                        | Create (overwrite) an image and mount it read-write. Caller must `vfs_close()`.                                       |
+| `vfs_open(path, readonly, &vfs)`                | Mount an existing image. Short/corrupt images fail with `VFS_ERR_CORRUPT`, never `SIGBUS`. Caller must `vfs_close()`. |
+| `vfs_close(vfs)`                                | Flush (unless read-only) and free the handle. `NULL` is a no-op.                                                      |
+| `vfs_sync(vfs)`                                 | Flush superblock, bitmap, and dirty inodes to the host file. No-op success when read-only.                            |
+| `vfs_open_embedded(data, size, readonly, &vfs)` | Mount from a static memory array via an anonymous `memfd` (Linux) — ideal for linked-in assets.                       |
 
 ### Random-Access File I/O
 
 The general-purpose primitives for small writes, overwrites, appends, and memory-buffer I/O. Thread-safe; parallel across files.
 
-| Function                                                              | Description                                                                                          |
-| :-------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
-| `vfs_fopen(vfs, path, flags)`                                         | Open/create a file. Returns a non-negative `vfs_fd_t`, or a negative `vfs_status_t` on error.        |
-| `vfs_fclose(vfs, fd)`                                                 | Release a descriptor. Does not force a metadata flush — call `vfs_sync()` if needed.                 |
-| `vfs_fread(vfs, fd, buf, count, &bytes_read)`                         | Read up to `count` bytes; advances the cursor. `0` bytes at EOF. Holes read as zeros.                |
-| `vfs_fwrite(vfs, fd, buf, count, &bytes_written)`                     | Write bytes, allocating extents as needed; full-block overwrites skip zero-fill. Honors `O_APPEND`. |
-| `vfs_fseek(vfs, fd, offset, whence, &new_offset)`                     | Reposition the cursor (`VFS_SEEK_SET/CUR/END`). May seek past EOF (sparse gap).                      |
-| `vfs_ftell(vfs, fd, &pos)`                                            | Query the cursor position.                                                                           |
-| `vfs_write_file(vfs, path, content, len)`                             | Create-or-truncate + write a whole memory buffer in one call.                                        |
-| `vfs_append_file(vfs, path, data, len)`                               | Create-if-missing + append a whole memory buffer in one call.                                        |
-| `vfs_read_file(vfs, path, &out_size)`                                 | Read a whole file into a heap buffer (caller frees; `NULL` on any failure).                          |
+| Function                                          | Description                                                                                         |
+| :------------------------------------------------ | :-------------------------------------------------------------------------------------------------- |
+| `vfs_fopen(vfs, path, flags)`                     | Open/create a file. Returns a non-negative `vfs_fd_t`, or a negative `vfs_status_t` on error.       |
+| `vfs_fclose(vfs, fd)`                             | Release a descriptor. Does not force a metadata flush — call `vfs_sync()` if needed.                |
+| `vfs_fread(vfs, fd, buf, count, &bytes_read)`     | Read up to `count` bytes; advances the cursor. `0` bytes at EOF. Holes read as zeros.               |
+| `vfs_fwrite(vfs, fd, buf, count, &bytes_written)` | Write bytes, allocating extents as needed; full-block overwrites skip zero-fill. Honors `O_APPEND`. |
+| `vfs_fseek(vfs, fd, offset, whence, &new_offset)` | Reposition the cursor (`VFS_SEEK_SET/CUR/END`). May seek past EOF (sparse gap).                     |
+| `vfs_ftell(vfs, fd, &pos)`                        | Query the cursor position.                                                                          |
+| `vfs_write_file(vfs, path, content, len)`         | Create-or-truncate + write a whole memory buffer in one call.                                       |
+| `vfs_append_file(vfs, path, data, len)`           | Create-if-missing + append a whole memory buffer in one call.                                       |
+| `vfs_read_file(vfs, path, &out_size)`             | Read a whole file into a heap buffer (caller frees; `NULL` on any failure).                         |
 
 ### Bulk Transfer (Fast Path)
 
 For moving whole files between host descriptors and the VFS. Each contiguous extent travels in a single kernel-side copy — use these instead of `fread`/`fwrite` loops for bulk work.
 
-| Function                                                                                 | Description                                                                                                                                                                                                     |
-| :--------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vfs_import_fd(vfs, fd, host_fd, size)`                                                  | Import `size` bytes from host offset 0 into `fd` (pass a freshly created/truncated file). Reflinked metadata-only where supported; transparent `pread`/`pwrite` fallback otherwise. Short sources report `VFS_ERR_IO`. |
-| `vfs_export_fd(vfs, out_fd, in_fd, offset, count, &bytes_sent)`                          | Same interface/semantics as `vfs_sendfile()`. Fast path for regular-file destinations starting at offset 0; sockets, pipes, and non-zero offsets delegate to `vfs_sendfile()` byte-identically. Sparse holes materialise as zeros via extend-only sizing. |
-| `vfs_sendfile(vfs, out_fd, in_fd, offset, count, &bytes_sent)`                           | Kernel `sendfile(2)` transfer to any destination (sockets, pipes, files). `offset != NULL` leaves the cursor untouched (Linux `sendfile` semantics); `NULL` uses/advances it. Short transfer + `VFS_OK` means EOF.          |
+| Function                                                        | Description                                                                                                                                                                                                                                               |
+| :-------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vfs_import_fd(vfs, fd, host_fd, size)`                         | Import `size` bytes from host offset 0 into `fd` (pass a freshly created/truncated file). Reflinked metadata-only where supported; transparent `pread`/`pwrite` fallback otherwise. Short sources report `VFS_ERR_IO`.                                    |
+| `vfs_export_fd(vfs, out_fd, in_fd, offset, count, &bytes_sent)` | Same interface/semantics as `vfs_sendfile()`. Fast path for regular-file destinations starting at offset 0; sockets, pipes, and non-zero offsets delegate to `vfs_sendfile()` byte-identically. Sparse holes materialise as zeros via extend-only sizing. |
+| `vfs_sendfile(vfs, out_fd, in_fd, offset, count, &bytes_sent)`  | Kernel `sendfile(2)` transfer to any destination (sockets, pipes, files). `offset != NULL` leaves the cursor untouched (Linux `sendfile` semantics); `NULL` uses/advances it. Short transfer + `VFS_OK` means EOF.                                        |
 
 ### Which Transfer API Should I Use?
 
-| Situation                                              | Use                  | Why                                                                 |
-| :----------------------------------------------------- | :------------------- | :------------------------------------------------------------------ |
-| Importing a host file into the VFS                     | `vfs_import_fd`      | One extent-sized kernel copy per run; reflinkable.                  |
-| Exporting to a host file                               | `vfs_export_fd`      | Same, in reverse; holes become sparse zeros for free.               |
-| Serving to a socket/pipe (HTTP, IPC)                   | `vfs_sendfile`       | Only API that targets non-regular destinations.                     |
-| Small / random / memory-buffer writes                  | `vfs_fwrite` family  | Fast path APIs only handle whole-file fd-to-fd bulk moves.          |
-| Partial export at a non-zero offset                    | `vfs_sendfile`       | `vfs_export_fd` delegates there automatically anyway.               |
+| Situation                             | Use                 | Why                                                        |
+| :------------------------------------ | :------------------ | :--------------------------------------------------------- |
+| Importing a host file into the VFS    | `vfs_import_fd`     | One extent-sized kernel copy per run; reflinkable.         |
+| Exporting to a host file              | `vfs_export_fd`     | Same, in reverse; holes become sparse zeros for free.      |
+| Serving to a socket/pipe (HTTP, IPC)  | `vfs_sendfile`      | Only API that targets non-regular destinations.            |
+| Small / random / memory-buffer writes | `vfs_fwrite` family | Fast path APIs only handle whole-file fd-to-fd bulk moves. |
+| Partial export at a non-zero offset   | `vfs_sendfile`      | `vfs_export_fd` delegates there automatically anyway.      |
 
 ### Namespace & Metadata
 
-| Function                                                        | Description                                                                                          |
-| :-------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
-| `vfs_stat(vfs, path, &st)`                                      | Fill `vfs_stat_t` (`path`, `size`, `block_count`, `created_at`, `modified_at`).                      |
-| `vfs_exists(vfs, path)`                                         | Boolean existence test.                                                                              |
-| `vfs_unlink(vfs, path)`                                         | Delete a file, freeing data, overflow, and inode. Closes any open descriptors on it.                 |
-| `vfs_rename(vfs, oldpath, newpath)`                             | Rename; an existing destination is replaced (POSIX `rename(2)` semantics). No data moves.            |
-| `vfs_truncate(vfs, path, length)`                               | Shrink (frees tail extents, zeroes the partial tail block) or grow (sparse, allocates nothing).      |
-| `vfs_list(vfs, prefix, callback, userdata)`                     | Call `callback(path, st, userdata)` per file under `prefix` (`"/"` or `""` = all). Return `false` to stop early. |
+| Function                                    | Description                                                                                                      |
+| :------------------------------------------ | :--------------------------------------------------------------------------------------------------------------- |
+| `vfs_stat(vfs, path, &st)`                  | Fill `vfs_stat_t` (`path`, `size`, `block_count`, `created_at`, `modified_at`).                                  |
+| `vfs_exists(vfs, path)`                     | Boolean existence test.                                                                                          |
+| `vfs_unlink(vfs, path)`                     | Delete a file, freeing data, overflow, and inode. Closes any open descriptors on it.                             |
+| `vfs_rename(vfs, oldpath, newpath)`         | Rename; an existing destination is replaced (POSIX `rename(2)` semantics). No data moves.                        |
+| `vfs_truncate(vfs, path, length)`           | Shrink (frees tail extents, zeroes the partial tail block) or grow (sparse, allocates nothing).                  |
+| `vfs_list(vfs, prefix, callback, userdata)` | Call `callback(path, st, userdata)` per file under `prefix` (`"/"` or `""` = all). Return `false` to stop early. |
 
 ### Utility
 
-| Function                             | Description                                                              |
-| :----------------------------------- | :----------------------------------------------------------------------- |
-| `vfs_strerror(status)`               | Human-readable string for any `vfs_status_t`. Never `NULL`.              |
-| `vfs_dump(vfs, out)`                 | Superblock, free-extent, inode-table, and open-file diagnostics to `FILE*`. |
+| Function               | Description                                                                 |
+| :--------------------- | :-------------------------------------------------------------------------- |
+| `vfs_strerror(status)` | Human-readable string for any `vfs_status_t`. Never `NULL`.                 |
+| `vfs_dump(vfs, out)`   | Superblock, free-extent, inode-table, and open-file diagnostics to `FILE*`. |
 
 ### Open Flags, Seek Origins & Error Codes
 
@@ -680,7 +680,7 @@ The Makefile builds the static library, the test suite, and the CLI (the CLI nee
 make            # lib/libvfs.a + bin/vfs_test + bin/vfs-cli
 make test       # build (if needed) and run the full suite + benchmarks
 make clean      # remove build artifacts
-sudo make install   # install libvfs.a + vfs.h (honours PREFIX/DESTDIR)
+sudo make install   # install libvfs.a + vfs.h + vfs-cli (when available; honours PREFIX/DESTDIR)
 ```
 
 The comprehensive test suite verifies extent mapping, multi-threaded concurrent I/O, sparse file allocation, `sendfile` transfers, error paths, and throughput benchmarks.
